@@ -1,0 +1,118 @@
+[general]
+tags = ["X", "Y", "Z"]
+default_layout = "floating"
+master_ratio = 0.5
+
+[bar]
+height = 30
+font = "monospace 9"
+bg = "#121212"
+fg = "#888888"
+clock_format = "%a %b %d %Y   %I:%M:%S %p %Z"
+tag_focused_bg = "#4A4881"
+tag_focused_fg = "#ffffff"
+tag_occupied_fg = "#888888"
+tag_empty_fg = "#555555"
+
+[startup]
+commands = []
+
+[gordian_knot]
+bg = "#121212"
+fg = "#c8c8c8"
+accent = "#e5a93d"
+font = "monospace 12"
+idle_timeout_seconds = 600
+prompt = "PASSWORD"
+
+[[keybind]]
+mods = ["Super"]
+key = "Return"
+action = "spawn"
+args = "kitty"
+
+[[keybind]]
+mods = ["Super"]
+key = "r"
+action = "run_prompt"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "q"
+action = "close_window"
+
+[[keybind]]
+mods = ["Super", "Control", "Shift"]
+key = "q"
+action = "quit"
+
+[[keybind]]
+mods = ["Alt"]
+key = "Tab"
+action = "mru_next"
+
+[[keybind]]
+mods = ["Alt", "Shift"]
+key = "Tab"
+action = "mru_prev"
+
+[[keybind]]
+mods = ["Super"]
+key = "1"
+action = "view_tag"
+args = "1"
+
+[[keybind]]
+mods = ["Super"]
+key = "2"
+action = "view_tag"
+args = "2"
+
+[[keybind]]
+mods = ["Super"]
+key = "3"
+action = "view_tag"
+args = "3"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "1"
+action = "move_to_tag"
+args = "1"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "2"
+action = "move_to_tag"
+args = "2"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "3"
+action = "move_to_tag"
+args = "3"
+
+[[keybind]]
+mods = ["Super"]
+key = "Left"
+action = "view_prev_tag"
+
+[[keybind]]
+mods = ["Super"]
+key = "Right"
+action = "view_next_tag"
+
+[[keybind]]
+mods = ["Super"]
+key = "space"
+action = "toggle_layout"
+
+[[keybind]]
+mods = ["Super"]
+key = "f"
+action = "toggle_fullscreen"
+
+[[keybind]]
+mods = ["Super"]
+key = "a"
+action = "toggle_above"

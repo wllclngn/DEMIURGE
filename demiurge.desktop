@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=DEMIURGE
+Comment=Minimal X11 window manager
+Exec=systemctl --user start --wait demiurge.service
+TryExec=/usr/local/bin/demiurge
+Type=Application
+DesktopNames=DEMIURGE

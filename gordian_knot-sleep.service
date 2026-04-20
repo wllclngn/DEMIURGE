@@ -1,0 +1,12 @@
+[Unit]
+Description=Lock the session before suspend (gordian_knot)
+Before=sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+[Service]
+Type=forking
+Environment=XDG_SESSION_TYPE=x11
+ExecStart=/usr/local/bin/gordian_knot
+TimeoutStartSec=10
+
+[Install]
+WantedBy=sleep.target suspend.target hibernate.target hybrid-sleep.target
