@@ -186,6 +186,13 @@ pub fn prompt_loop(tty_fd: RawFd, user: &str, prompt: &str) -> i32 {
             None => return 1, // Eof / read error -- bail, parent will release.
         };
 
+        // Gate empty submissions. pam_faildelay + pam_faillock compound on
+        // repeated empty attempts and will lock the account out for minutes.
+        // Mashing Enter should be a no-op, not a self-lockout.
+        if password.is_empty() {
+            continue;
+        }
+
         match pam::authenticate(user, &password) {
             Ok(()) => return 0,
             Err(e) => {

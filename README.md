@@ -1,231 +1,321 @@
 # DEMIURGE
 
-Minimal X11 window manager in Rust, purpose-built to replace AwesomeWM. Named for the Gnostic craftsman-creator who fashions the physical world from the abstract: the WM takes running processes and gives them visible form on screen.
+ATTENTION: There are currently plans to implement DEMIURGE in Wayland. However, w/ the present state of awesomewm on Arch Linux, DEMIURGE's release was expedited. As of 4/20/2026 X11 is the only implementation of DEMIURGE available.
 
-AwesomeWM is ~87K LOC (29K C + 58K Lua); most of it was unused. DEMIURGE does exactly what the user needs -- 3 tags, ~18 keybindings, a top bar, Alt+Tab MRU cycling, click-to-focus, Super+drag move/resize, no titlebars, no decorations, no compositor -- in ~5,500 LOC of Rust including a full screen locker.
+Minimal X11 window manager in Rust. Drop-in replacement for AwesomeWM. Non-reparenting, single-threaded, zero mutexes. Ships GORDIAN KNOT (screen locker) and a shared rendering module (`torrentius`) in the same Cargo package.
 
-## Orchestration
+Target: rustc 1.85+ (Rust 2024 edition). Linux only. X11 only.
 
-DEMIURGE is two binaries that share the same Cargo package, plus a rendering module they both consume.
+## Components
 
-| Component | Role |
+| Binary / module | Role |
 |---|---|
-| `demiurge` | The window manager. Non-reparenting, single-threaded, zero mutexes. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar. |
-| `torrentius` | Rendering subsystem (not a binary). Named for Johannes Torrentius and his camera obscura. Owns all Cairo/Pango primitives, PNG capture, and framed-panel rendering. Used by both binaries. |
-| `gordian_knot` | VT + X11 screen locker. Named for the Phrygian knot that only the destined could untie. PAM authentication, privilege separation, seccomp-bpf + landlock sandboxing, idle-watcher daemon, lock-on-suspend hook, inhibit respect via D-Bus. |
-
-## Features
-
-### Window manager
-
-- Non-reparenting (dwm/xmonad/pgwm pattern; no decoration management)
-- TOML config with inotify hot-reload (edit during a session, bindings + colors update live)
-- Three layouts: floating, tile (master-stack), monocle; per-tag layout state
-- MRU Alt+Tab with keyboard grab cycling
-- Status bar with subpixel-AA text (Cairo RGB24 + Pango); per-monitor panels
-- Run prompt with `$PATH` tab-completion and ghost text
-- Super+drag move/resize, CSD `_NET_WM_MOVERESIZE`
-- EWMH: dialog/transient auto-float, fullscreen save/restore, initial `_NET_WM_STATE`, `WM_TAKE_FOCUS`, `_NET_WM_ALLOWED_ACTIONS`
-- RandR multi-monitor bar
-- Screenshot capture via the `screenshot` action -> `~/Pictures/screenshot-YYYYmmdd-HHMMSS.png`
-- `SIGCHLD` reaping so spawned apps don't accumulate as zombies in the service cgroup
-- `OZONE_PLATFORM=x11` in the service unit so Chromium/Electron children launch cleanly
-- `demiurge --check-config` validates an existing config before the installer preserves it across reinstalls
-
-### Screen locker (gordian_knot)
-
-- Real PAM authentication via inline FFI (no pam-sys / pam crate; direct `libpam.so.0` link)
-- Privilege separation: setuid-root binary, `setresuid` + `PR_SET_NO_NEW_PRIVS` drop to user before PAM + UI
-- seccomp-bpf syscall allowlist (raw BPF, no libseccomp), `SECCOMP_RET_KILL_PROCESS` on anything outside the whitelist
-- landlock filesystem sandbox (raw syscalls, no helper crate), read-only over `/etc /usr /lib /lib64 /proc /sys /dev /run /tmp`, `/home` + `/root` explicitly excluded
-- X11 in-session lock: fullscreen override-redirect window, exclusive keyboard + pointer grab (with retry), monospace SYSTEM + USER panels rendered via `torrentius::draw_panel`, dot-echo password input
-- VT fallback: when X11 grab fails or `$DISPLAY` is unset, acquires a fresh `/dev/ttyN` via `VT_OPENQRY` + `VT_LOCKSWITCH`, text-mode UI on the console
-- Idle auto-lock (`--daemon`): XScreenSaver polling, configurable threshold (`idle_timeout_seconds`)
-- Inhibit respect: zbus D-Bus watcher on `org.freedesktop.login1.Manager.ListInhibitors`, suppresses auto-lock during video playback and fullscreen games
-- Lock before suspend: `gordian_knot-sleep.service` with `Before=sleep.target suspend.target hibernate.target hybrid-sleep.target`
-- Signalfd-driven cleanup (no `atexit`): SIGSEGV/SIGBUS/SIGFPE still release the VT
+| `demiurge` | Window manager. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar, tag-targeted startup spawns. |
+| `gordian_knot` | Screen locker + idle daemon + lock-on-suspend hook. Setuid-root with seccomp-bpf + landlock sandbox. PAM authentication via inline FFI. |
+| `torrentius` | Rendering subsystem (not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by both binaries. |
 
 ## Build
-
-Requires Rust 2024 edition (rustc 1.85+), cairo, pango, pangocairo, libpam (runtime + headers).
 
 ```
 CARGO_TARGET_DIR=/tmp/demiurge-build cargo build --release
 CARGO_TARGET_DIR=/tmp/demiurge-build cargo test
 ```
 
-Binaries: `/tmp/demiurge-build/release/{demiurge, gordian_knot}`
+Binaries land in `/tmp/demiurge-build/release/{demiurge, gordian_knot}`.
+92 tests pass across 9 targets.
+
+System deps (Arch package names): `cairo pango libpam rust`.
 
 ## Install
 
 ```
 ./install.py              # Build, install everything (WM + locker + services)
-./install.py -y           # Non-interactive: assume yes to all prompts
+./install.py -y           # Non-interactive
 ./install.py status       # Show installation status
 ./install.py update       # Rebuild and reinstall if source changed
-./install.py uninstall    # Remove all installed files (config preserved)
+./install.py uninstall    # Remove installed files (config preserved)
 ```
 
 Install layout:
 
-| Path | Notes |
-|---|---|
-| `/usr/local/bin/demiurge` | WM binary (sudo) |
-| `/usr/local/bin/gordian_knot` | Locker binary, mode 4755 (setuid-root, sudo) |
-| `/etc/pam.d/gordian_knot` | PAM stack: `auth include system-auth` (sudo) |
-| `/usr/share/xsessions/demiurge.desktop` | Display-manager entry (sudo) |
-| `~/.config/systemd/user/demiurge.service` | WM systemd unit |
-| `~/.config/systemd/user/gordian_knot-daemon.service` | Idle-watcher service |
-| `~/.config/systemd/user/gordian_knot-sleep.service` | Lock-before-suspend hook |
-| `~/.config/demiurge/config.toml` | User config (only written if missing) |
+| Path | Owner | Notes |
+|---|---|---|
+| `/usr/local/bin/demiurge` | root | WM binary |
+| `/usr/local/bin/gordian_knot` | root | Locker, mode 4755 (setuid-root) |
+| `/etc/pam.d/gordian_knot` | root | `auth include system-auth` |
+| `/usr/share/xsessions/demiurge.desktop` | root | Display-manager entry |
+| `~/.config/systemd/user/demiurge.service` | user | WM service |
+| `~/.config/systemd/user/gordian_knot-daemon.service` | user | Idle watcher |
+| `~/.config/systemd/user/gordian_knot-sleep.service` | user | Pre-suspend hook |
+| `~/.config/demiurge/config.toml` | user | Copied from `config.default.toml` only if missing |
 
-Session launch: the `.desktop` runs `systemctl --user start --wait demiurge.service`, which runs the binary. Everything goes to `journalctl --user -u demiurge`.
+If an existing `config.toml` is present at install time, `install.py` runs
+`demiurge --check-config` against it. A parse failure offers a backup
+(`config.toml.bak`) + replace with the shipped default.
 
-On install, if an existing config is present, the installer runs the freshly-built binary with `--check-config` against it. If it fails to parse, the installer offers to back it up to `config.toml.bak` and drop in the shipped default. This is the fix for the "stale config silently kills the session across reinstalls" foot-gun we hit during v0.2.0 deployment.
+## Run
 
-## Testing in nested X (Xephyr)
+Session launch (display manager path): the `.desktop` file runs
+`systemctl --user start --wait demiurge.service`. Logs to
+`journalctl --user -u demiurge`.
+
+Nested X (Xephyr):
 
 ```
 Xephyr :1 -screen 2560x1440 &
 DISPLAY=:1 /tmp/demiurge-build/release/demiurge
 ```
 
+## CLI flags
+
+```
+demiurge [-c config.toml] [--check-config] [--setup] [-v] [-h]
+```
+
+| Flag | Effect |
+|---|---|
+| `-c` / `--config PATH` | Override config path (default `~/.config/demiurge/config.toml`) |
+| `--check-config` | Parse config, print `demiurge: config ok (PATH)` on success, exit 0/1. No WM startup. |
+| `--setup` | lxappearance replacement: regenerate `~/.gtkrc-2.0`, `~/.config/gtk-3.0/settings.ini`, `~/.icons/default/index.theme` from `[cursor]` + `[font]`. Exit without starting the WM. |
+| `-v` / `--version` | Print version |
+| `-h` / `--help` | Usage |
+
+## Config reference
+
+Path: `~/.config/demiurge/config.toml`. ENOENT falls back to
+`Config::default()`. Hot-reloaded via inotify on `IN_CLOSE_WRITE`.
+
+### `[general]`
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `tags` | `[String]` | `["X", "Y", "Z"]` | Must be non-empty |
+| `default_layout` | `String` | `"floating"` | `floating`, `tile`, or `monocle` |
+| `master_ratio` | `f64` | `0.5` | `(0.0, 1.0)` exclusive |
+| `border_width` | `u32` | `0` | Accepted but unused (always 0) |
+| `focus_model` | `String` | `"click"` | Accepted but unused (click-to-focus only) |
+
+### `[bar]`
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `height` | `u32` | `40` | Panel height in px; hot-reloads |
+| `font` | `String` | `"Noto Sans 9"` | Pango font string |
+| `bg` / `fg` | `String` | `#121212` / `#888888` | Hex `#RRGGBB` |
+| `clock_format` | `String` | `"%a %b %d %Y   %I:%M:%S %p %Z"` | `strftime` syntax. Rendered with `font_features="tnum"` for stable digit widths. |
+| `tag_focused_bg` | `String` | `#4A4881` | |
+| `tag_focused_fg` | `String` | `#ffffff` | |
+| `tag_occupied_fg` | `String` | `#888888` | |
+| `tag_empty_fg` | `String` | `#555555` | |
+| `notification_fg` | `String` | `#e5a93d` | Color for transient `NOTIFICATION:` text in the bar center |
+
+### `[cursor]` and `[font]`
+
+lxappearance replacement. `[cursor] theme` is exported as `XCURSOR_THEME`
+and `[cursor] size` as `XCURSOR_SIZE` at WM init so every spawned child
+inherits. `demiurge --setup` writes the equivalent GTK + icon defaults
+files.
+
+| Key | Type | Default |
+|---|---|---|
+| `cursor.theme` | `String` | `"default"` |
+| `cursor.size` | `u32` | `24` |
+| `font.default` | `String` | `"Noto Sans 9"` |
+
+### `[startup]`
+
+```toml
+[startup]
+commands = [
+    "xset r rate 185 30",
+    "xrandr -s 2560x1440",
+    "xrandr --dpi 138",
+    "xrdb -merge ~/.Xresources",
+]
+
+[[startup.spawn]]
+cmd = "kitty"
+tag = "X"
+
+[[startup.spawn]]
+cmd = "kitty --class montauk-term -e montauk"
+tag = "Z"
+class = "montauk-term"
+```
+
+`commands` runs each entry via `spawn::spawn()` at WM startup.
+Fire-and-forget.
+
+`[[startup.spawn]]` is tag-targeted. `cmd` launches; the next window
+whose `WM_CLASS` matches is routed to `tag` and kept unmapped until the
+user views that tag. `class` overrides the default derivation (first
+whitespace-separated token of `cmd`). FIFO consumption: two pending
+entries with the same class are matched in spawn order. Config-load
+validation rejects unknown tag names and empty commands.
+
+### `[[keybind]]`
+
+```toml
+[[keybind]]
+mods = ["Super", "Shift"]    # Any subset of Super/Alt/Control/Shift
+key = "Return"               # Keysym name or 0x... hex
+action = "spawn"             # See action table below
+args = "kitty"               # Optional; required for some actions
+```
+
+Actions:
+
+| Action | `args` | Effect |
+|---|---|---|
+| `spawn` | command string | `posix_spawn` the command; metacharacters trigger `sh -c` wrapping |
+| `close_window` | — | Send `WM_DELETE_WINDOW` to focus |
+| `quit` | — | Clean WM shutdown |
+| `mru_next` | — | Alt+Tab forward through the MRU ring, **restricted to the active tag** |
+| `mru_prev` | — | Alt+`/Alt+Shift+Tab backward through the MRU ring, active tag only |
+| `mru_next_global` | — | Super+Tab forward across **all tags** (switches tag as needed) |
+| `mru_prev_global` | — | Super+Shift+Tab backward across all tags |
+| `view_tag` | `"1"` .. `"N"` | Switch to tag (1-indexed) |
+| `view_prev_tag` | — | Previous tag |
+| `view_next_tag` | — | Next tag |
+| `move_to_tag` | `"1"` .. `"N"` | Move focused window to tag |
+| `toggle_above` | — | Toggle `_NET_WM_STATE_ABOVE` on focused |
+| `toggle_fullscreen` | — | Toggle `_NET_WM_STATE_FULLSCREEN` on focused |
+| `toggle_layout` | — | Cycle active tag's layout |
+| `run_prompt` | — | Show bar run prompt with `$PATH` tab-completion |
+| `screenshot` | — | Write `~/Pictures/screenshot-YYYYmmdd-HHMMSS.png` via `XGetImage` + Cairo PNG |
+| `lock` | — | Spawn `gordian_knot` |
+| `volume_up` / `volume_down` | — | `wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%±`, read back, fire bar notification |
+| `volume_mute` | — | Toggle `@DEFAULT_AUDIO_SINK@` mute, fire bar notification |
+| `volume_mic_mute` | — | Toggle `@DEFAULT_AUDIO_SOURCE@` mute, fire bar notification |
+| `brightness_up` / `brightness_down` | — | `xbacklight -inc 5` / `-dec 5`, read back, fire bar notification |
+| `media_play_pause` / `media_next` / `media_prev` | — | `playerctl`, fire bar notification with current state + track |
+
+Modifiers: `Super`, `Alt`, `Control`, `Shift`. Recognized keysym names
+are in `src/keys.rs::name_to_keysym`. Unknown keysyms can be specified
+as raw hex (`0xff09` for Tab). Lock/NumLock are stripped from incoming
+state before matching.
+
+### `[gordian_knot]`
+
+Consumed by the locker binary. `demiurge` itself ignores it.
+
+| Key | Type | Default |
+|---|---|---|
+| `bg` | `String` | `#121212` |
+| `fg` | `String` | `#c8c8c8` |
+| `accent` | `String` | `#e5a93d` |
+| `font` | `String` | `"monospace 12"` |
+| `idle_timeout_seconds` | `u64` | `600` |
+| `prompt` | `String` | `"PASSWORD"` |
+
+## Window cycling (cyclical MRU ring)
+
+`wm.mru: Vec<Window>` ordered most-recently-used-first; each window
+appears exactly once. Two cycling scopes:
+
+- **Alt+Tab / Alt+` / Alt+Esc** (`mru_next`, `mru_prev`) — cycle
+  windows on the **active tag only**. Tag stays put. Classic
+  same-desktop window switcher.
+- **Super+Tab / Super+Shift+Tab** (`mru_next_global`,
+  `mru_prev_global`) — cycle across **all tags**. The tag switches
+  as needed while you hold the modifier; on release, you land on the
+  target's tag with the target focused.
+
+On first press, `mru.rs` grabs the keyboard, freezes the candidate
+list under the requested scope, and sets a `cycle_index` pointing at
+the visually-raised target. Further presses advance the index modulo
+the candidate count. On modifier release, `finish_cycle` commits
+`candidates[index]` to position 0 of `wm.mru` via the normal
+`on_focus` path.
+
+`focus_window` dedupes: any focus change removes the target from the
+ring and re-inserts at position 0. Destroyed windows are scrubbed
+from the ring via `on_unmanage`.
+
+## Notifications
+
+Volume, brightness, and media keybinds fire a transient `NOTIFICATION:`
+message that replaces the focused-window title in the bar center for
+1500 ms, rendered in `bar.notification_fg`. Format:
+
+```
+NOTIFICATION: System Volume, 50%.
+NOTIFICATION: System Volume, MUTED.
+NOTIFICATION: Microphone, MUTED.
+NOTIFICATION: Brightness, 75%.
+NOTIFICATION: Playing, Title — Artist.
+NOTIFICATION: Paused.
+```
+
+Expiry is checked on every `redraw_bar` call; since the 1-second
+timerfd tick drives redraws, notifications clear with at most ~1 s
+overshoot past TTL.
+
+Runtime deps for the action handlers (not enforced at build time):
+`wpctl` (wireplumber), `xbacklight`, `playerctl`.
+
+## Hot-reload
+
+inotify watches the config file on `IN_CLOSE_WRITE`. On change,
+`wm::reload_config` applies:
+
+- Keybindings: recompiled, ungrabbed, regrabbed
+- Colors, font, clock format: reapplied to bar
+- Bar height: panel windows reconfigured, `_NET_WM_STRUT_PARTIAL`
+  re-emitted, `_NET_WORKAREA` updated, `arrange()` triggered
+- `master_ratio`: reapplied
+
+Keybindings can be edited and applied without restarting the session.
+
 ## Architecture
 
-Single-threaded, zero mutexes in the WM. `x11rb` for X11, Cairo + Pango for rendering. TOML config via serde.
+Single-threaded, zero mutexes. `x11rb` for X11 (pure Rust, no Xlib).
+Cairo + Pango for rendering. `serde` + `toml` for config.
 
 ```
 src/
-  main.rs           WM entry. CLI args (-c, --check-config, -v, -h).
-                    signalfd (SIGINT/SIGTERM/SIGCHLD), poll(), inotify.
-  config.rs         TOML config: tags, keybindings, bar, startup,
-                    [gordian_knot]. ENOENT -> Config::default().
-  atoms.rs          EWMH/ICCCM atom table
-  wm.rs             State machine: manage/unmanage, focus, tags, layout.
-                    Client.unmap_ignore counter for tag-switch handling.
-  event.rs          X11 event dispatcher (unmap handler consumes
-                    unmap_ignore to distinguish WM self-unmaps from
-                    client withdraws).
-  keys.rs           Keysym resolution, grabs, dispatch. Actions include
-                    spawn, close_window, quit, mru_next/prev,
-                    view_tag, view_prev/next_tag, move_to_tag,
-                    toggle_above, toggle_fullscreen, toggle_layout,
-                    run_prompt, screenshot, lock.
-  ewmh.rs           EWMH property setters, allowed actions, WM check
-  bar.rs            Multi-monitor status bar. Uses torrentius primitives.
-  layout.rs         Floating, tile, monocle
-  mouse.rs          Super+drag move/resize, CSD _NET_WM_MOVERESIZE
-  mru.rs            Alt+Tab MRU cycling with keyboard grab
-  spawn.rs          posix_spawn for startup + keybind commands
+  main.rs           CLI + signalfd + poll loop + inotify
+  config.rs         TOML schema + validation
+  atoms.rs          EWMH/ICCCM atoms
+  appearance.rs     XCURSOR env exports + --setup file writer
+  wm.rs             Core state: clients, focus, tags, layouts,
+                    pending_spawns, mru
+  event.rs          X11 event dispatcher
+  keys.rs           Keysym resolution, grabs, action dispatch
+  ewmh.rs           EWMH property setters
+  bar.rs            Multi-monitor status bar rendering
+  layout.rs         floating / tile / monocle
+  mouse.rs          Super+drag move/resize, _NET_WM_MOVERESIZE
+  mru.rs            Cyclical MRU ring
+  spawn.rs          posix_spawn with metachar detection
   monitor.rs        RandR monitor query
-  torrentius.rs     Rendering subsystem. Cairo/Pango primitives,
-                    framed-panel renderer, PNG capture.
-  lib.rs            Module declarations
+  torrentius.rs     Cairo/Pango primitives shared by demiurge + gordian_knot
 
-  gordian_knot/     Locker subsystem
+  gordian_knot/
     mod.rs
-    sysinfo.rs      HOSTNAME, KERNEL, DATE, TIME, UPTIME -- libc + /proc
-    pam.rs          Inline FFI + safe pam::authenticate(user, password)
-    privsep.rs      fork_child + drop_to_real_user (setresuid +
-                    PR_SET_NO_NEW_PRIVS) + wait_child
+    sysinfo.rs      HOSTNAME/KERNEL/DATE/TIME/UPTIME panels
+    pam.rs          Inline libpam.so.0 FFI
+    privsep.rs      fork + setresuid + PR_SET_NO_NEW_PRIVS
     seccomp.rs      Raw BPF syscall allowlist
-    landlock.rs     Raw landlock_* syscalls; read-only fs sandbox
-    vt.rs           /dev/console + VT_OPENQRY/VT_LOCKSWITCH + prompt loop
-    x11_lock.rs     Fullscreen override-redirect grab + torrentius panels
-                    + PAM conversation
-    daemon.rs       XScreenSaver idle polling, spawns locker on threshold
-    inhibit.rs      zbus watcher on logind ListInhibitors
+    landlock.rs     Raw landlock_* syscalls
+    vt.rs           /dev/ttyN acquisition via VT_OPENQRY + VT_LOCKSWITCH
+    x11_lock.rs     Fullscreen override-redirect + grabs + PAM loop
+    daemon.rs       XScreenSaver idle polling
+    inhibit.rs      logind ListInhibitors watcher (zbus)
 
   bin/
-    gordian_knot.rs Dispatcher: --vt, --x11, --daemon, --check-config,
-                    --no-sandbox. X11 first, VT fallback.
+    gordian_knot.rs Locker dispatcher: --vt, --x11, --daemon
 
 tests/
-  config.rs         Config parsing (16 tests)
+  config.rs         Config parsing (19 tests)
   bar.rs            Color parsing, PATH scan, completion (13 tests)
   layout.rs         Layout cycle (3 tests)
-  mru.rs            MRU list behavior (9 tests)
+  mru.rs            Cyclical MRU ring (15 tests)
   torrentius.rs     Hex parsers, font options, surfaces (9 tests)
-  unmap_ignore.rs   Counter invariants, saturation (5 tests)
-  gordian_knot.rs   [gordian_knot] config + sysinfo uptime formatter (12 tests)
-  xephyr.py         Manual test harness
+  unmap_ignore.rs   Unmap ignore counter invariants (5 tests)
+  gordian_knot.rs   Locker config + sysinfo (12 tests)
+  xephyr.py         Manual nested-X harness
 ```
-
-83 tests pass across 9 targets on the current build.
-
-## Config
-
-See `config.default.toml` for the shipped default. Key sections:
-
-```toml
-[general]
-tags = ["X", "Y", "Z"]
-default_layout = "floating"
-master_ratio = 0.5
-
-[bar]
-height = 30
-font = "monospace 9"
-bg = "#121212"
-fg = "#888888"
-clock_format = "%a %b %d %Y   %I:%M:%S %p %Z"
-tag_focused_bg = "#4A4881"
-tag_focused_fg = "#ffffff"
-tag_occupied_fg = "#888888"
-tag_empty_fg = "#555555"
-
-[startup]
-commands = []
-
-[gordian_knot]
-bg = "#121212"
-fg = "#c8c8c8"
-accent = "#e5a93d"
-font = "monospace 12"
-idle_timeout_seconds = 600
-prompt = "PASSWORD"
-
-[[keybind]]
-mods = ["Super"]
-key = "Return"
-action = "spawn"
-args = "kitty"
-
-[[keybind]]
-mods = ["Super"]
-key = "l"
-action = "lock"
-
-[[keybind]]
-mods = ["Super"]
-key = "Print"
-action = "screenshot"
-```
-
-Valid actions: `spawn`, `close_window`, `quit`, `mru_next`, `mru_prev`, `view_tag`, `view_prev_tag`, `view_next_tag`, `move_to_tag`, `toggle_above`, `toggle_fullscreen`, `toggle_layout`, `run_prompt`, `screenshot`, `lock`.
-
-Valid modifiers: `Super`, `Alt`, `Control`, `Shift`.
-
-`view_tag` and `move_to_tag` take a 1-indexed numeric `args` string (e.g. `"1"` for the first tag), not the tag name.
-
-## Screenshot
-
-Bind the `screenshot` action to any keybind; pressing it writes `~/Pictures/screenshot-YYYYmmdd-HHMMSS.png`. Uses `XGetImage` via x11rb and Cairo's PNG encoder. No subprocess, no Qt, no external tool.
-
-## gordian_knot usage
-
-```
-gordian_knot                 # X11 in-session lock; falls back to VT
-gordian_knot --vt            # Force VT lock (text-mode on fresh TTY)
-gordian_knot --x11           # Force X11 in-session lock
-gordian_knot --daemon        # Idle watcher; spawns locker on threshold
-gordian_knot --check-config  # Parse config and exit 0/1
-gordian_knot --no-sandbox    # Skip seccomp + landlock (debug only)
-```
-
-Services (installed to `~/.config/systemd/user/`):
-- `gordian_knot-daemon.service` -- idle watcher, `WantedBy=graphical-session.target`
-- `gordian_knot-sleep.service` -- fires before suspend, `Before=sleep.target suspend.target hibernate.target hybrid-sleep.target`
 
 ## Dependencies
 
@@ -242,20 +332,51 @@ zbus = "4"
 
 No Qt. No compositor runtime. No PAM helper crate (inline FFI).
 
-## Known limitations / future work
+## GORDIAN KNOT
 
-- **Multi-monitor: bar-only.** The bar creates one panel per RandR output, but fullscreen, tile, and monocle layouts still use `monitors[0]`. Invisible on single-monitor machines. Fix is a `client_monitor(client)` helper routed through the affected sites in `wm.rs`, `layout.rs`, `ewmh.rs`.
-- **gordian_knot on Wayland.** Phase 5 item. VT path still works on Wayland; X11 in-session lock does not.
-- **Alt+Tab visual feedback.** Cycling works but has no overlay preview. Torrentius + Alt+Tab overlay is a future expansion.
-- **RandR hot-plug.** `monitor.rs::query()` runs once at init.
-- **CSD edge resize directions 0-7.** `_NET_WM_MOVERESIZE` edge cases silently dropped. Affects Chromium-family edge resize.
-- **Urgency hints.** No `Client.urgent` field; would need WM_HINTS reads + tag-flash render.
-- **Config keys with no effect.** `[general] border_width` and `[general] focus_model` are accepted by the TOML parser but currently have no effect. Click-to-focus is always on; border width is always zero.
-- **gordian_knot manual verify surface.** PAM auth, X11 grabs, VT ioctls, privilege drop, seccomp, landlock, daemon loop, and D-Bus inhibit watcher cannot be unit-tested without affecting the test runner's process state. All other logic is covered.
+```
+gordian_knot                 # X11 in-session lock; VT fallback if X11 grab fails
+gordian_knot --vt            # Force VT lock on a fresh /dev/ttyN
+gordian_knot --x11           # Force X11 in-session lock
+gordian_knot --daemon        # Idle watcher; spawns locker on threshold
+gordian_knot --check-config  # Parse [gordian_knot] and exit 0/1
+gordian_knot --no-sandbox    # Skip seccomp + landlock (debug only)
+```
 
-## Style
+Security posture:
 
-- No decorative separators in comments or output (no `===`, `---`, `***`)
-- Log format: `[HH:MM:SS] [LEVEL]   message`
-- snake_case for locals/functions, PascalCase for types
-- Comments only where logic isn't self-evident
+- Setuid-root binary. `setresuid` + `PR_SET_NO_NEW_PRIVS` drop to the
+  real user before PAM + UI.
+- seccomp-bpf allowlist via raw BPF (no libseccomp).
+  `SECCOMP_RET_KILL_PROCESS` on any syscall outside the allowlist.
+- landlock read-only sandbox over `/etc /usr /lib /lib64 /proc /sys
+  /dev /run /tmp`. `/home` + `/root` explicitly excluded.
+- PAM via inline FFI against `libpam.so.0` (no pam / pam-sys crate).
+- Signalfd cleanup path releases the VT on SIGSEGV/SIGBUS/SIGFPE.
+
+Services:
+
+- `gordian_knot-daemon.service` — idle watcher,
+  `WantedBy=graphical-session.target`.
+- `gordian_knot-sleep.service` — `Before=sleep.target suspend.target
+  hibernate.target hybrid-sleep.target`.
+
+Inhibit: zbus watcher on `org.freedesktop.login1.Manager.ListInhibitors`
+suppresses auto-lock during video playback and fullscreen games.
+
+## Known limitations
+
+- Multi-monitor layout: bar panels are per-RandR-output, but
+  fullscreen / tile / monocle layouts use `monitors[0]` only. Invisible
+  on single-monitor machines.
+- No RandR hot-plug. `monitor::query()` runs once at init.
+- No Alt+Tab overlay (functional cycling only, no thumbnail preview).
+- `_NET_WM_MOVERESIZE` edge-resize directions 0–7 are silently
+  dropped. Affects Chromium-family edge drag.
+- No urgency hints. `WM_HINTS` urgent flag is ignored.
+- `[general] border_width` and `[general] focus_model` parse but have
+  no effect. Click-to-focus is hardcoded; borders are always zero.
+- GORDIAN KNOT on Wayland: VT path works, X11 in-session lock does not.
+- GORDIAN KNOT integration surface (PAM, VT ioctls, seccomp, landlock,
+  D-Bus) is not unit-testable without affecting the test-runner
+  process state. Logic layers are covered; these are manual-verify.

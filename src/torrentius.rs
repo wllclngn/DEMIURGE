@@ -12,7 +12,7 @@ use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
 // Colors for a framed panel. RGB triples in [0.0, 1.0].
-// Used by gordian_knot's X11 lock screen, not by demiurge's bar.
+// Used by GORDIAN KNOT's X11 lock screen, not by DEMIURGE's bar.
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct PanelColors {

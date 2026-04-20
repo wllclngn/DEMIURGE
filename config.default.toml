@@ -1,11 +1,12 @@
 [general]
 tags = ["X", "Y", "Z"]
 default_layout = "floating"
-master_ratio = 0.5
+border_width = 0
+focus_model = "click"
 
 [bar]
-height = 30
-font = "monospace 9"
+height = 40
+font = "Noto Sans 9"
 bg = "#121212"
 fg = "#888888"
 clock_format = "%a %b %d %Y   %I:%M:%S %p %Z"
@@ -14,84 +15,61 @@ tag_focused_fg = "#ffffff"
 tag_occupied_fg = "#888888"
 tag_empty_fg = "#555555"
 
+# lxappearance replacement: cursor theme + default font. `demiurge --setup`
+# writes the equivalent lxappearance files (GTK settings, icons/default)
+# from these values. XCURSOR_THEME and XCURSOR_SIZE are exported at WM init.
+[cursor]
+theme = "default"
+size = 24
+
+[font]
+default = "Noto Sans 9"
+
 [startup]
-commands = []
+commands = [
+    "xset r rate 185 30",
+    "xrandr -s 2560x1440",
+    "xrandr --dpi 138",
+    "xrdb -merge ~/.Xresources",
+    "cherrypie",
+]
 
-[gordian_knot]
-bg = "#121212"
-fg = "#c8c8c8"
-accent = "#e5a93d"
-font = "monospace 12"
-idle_timeout_seconds = 600
-prompt = "PASSWORD"
+[[startup.spawn]]
+cmd = "kitty"
+tag = "X"
 
+[[startup.spawn]]
+cmd = "kitty --class montauk-term -e montauk"
+tag = "Z"
+class = "montauk-term"
+
+# Terminal
 [[keybind]]
 mods = ["Super"]
 key = "Return"
 action = "spawn"
 args = "kitty"
 
-[[keybind]]
-mods = ["Super"]
-key = "r"
-action = "run_prompt"
-
-[[keybind]]
-mods = ["Super", "Shift"]
-key = "q"
-action = "close_window"
-
-[[keybind]]
-mods = ["Super", "Control", "Shift"]
-key = "q"
-action = "quit"
-
+# Close window
 [[keybind]]
 mods = ["Alt"]
-key = "Tab"
-action = "mru_next"
+key = "F4"
+action = "close_window"
 
+# Quit WM
 [[keybind]]
 mods = ["Alt", "Shift"]
-key = "Tab"
-action = "mru_prev"
+key = "F4"
+action = "quit"
 
+# Lock screen
 [[keybind]]
 mods = ["Super"]
-key = "1"
-action = "view_tag"
-args = "1"
+key = "Escape"
+action = "spawn"
+args = "physlock"
 
-[[keybind]]
-mods = ["Super"]
-key = "2"
-action = "view_tag"
-args = "2"
-
-[[keybind]]
-mods = ["Super"]
-key = "3"
-action = "view_tag"
-args = "3"
-
-[[keybind]]
-mods = ["Super", "Shift"]
-key = "1"
-action = "move_to_tag"
-args = "1"
-
-[[keybind]]
-mods = ["Super", "Shift"]
-key = "2"
-action = "move_to_tag"
-args = "2"
-
-[[keybind]]
-mods = ["Super", "Shift"]
-key = "3"
-action = "move_to_tag"
-args = "3"
-
+# Tag navigation
 [[keybind]]
 mods = ["Super"]
 key = "Left"
@@ -102,17 +80,164 @@ mods = ["Super"]
 key = "Right"
 action = "view_next_tag"
 
+# View tags 1-3
 [[keybind]]
 mods = ["Super"]
-key = "space"
-action = "toggle_layout"
+key = "1"
+action = "view_tag"
+args = "1"
 
+[[keybind]]
+mods = ["Super"]
+key = "2"
+action = "view_tag"
+args = "2"
+
+[[keybind]]
+mods = ["Super"]
+key = "3"
+action = "view_tag"
+args = "3"
+
+# Move window to tag
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "1"
+action = "move_to_tag"
+args = "1"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "2"
+action = "move_to_tag"
+args = "2"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "3"
+action = "move_to_tag"
+args = "3"
+
+# Alt+Tab / Alt+` cycle windows ON THE CURRENT TAG only.
+[[keybind]]
+mods = ["Alt"]
+key = "Tab"
+action = "mru_next"
+
+[[keybind]]
+mods = ["Alt"]
+key = "grave"
+action = "mru_prev"
+
+# Alt+Escape (Ducky One 2 Mini: no grave key)
+[[keybind]]
+mods = ["Alt"]
+key = "Escape"
+action = "mru_prev"
+
+# Super+Tab / Super+Shift+Tab cycle ACROSS ALL TAGS (global MRU).
+[[keybind]]
+mods = ["Super"]
+key = "Tab"
+action = "mru_next_global"
+
+[[keybind]]
+mods = ["Super", "Shift"]
+key = "Tab"
+action = "mru_prev_global"
+
+# Toggle always-on-top
+[[keybind]]
+mods = ["Super"]
+key = "t"
+action = "toggle_above"
+
+# Toggle fullscreen
 [[keybind]]
 mods = ["Super"]
 key = "f"
 action = "toggle_fullscreen"
 
+# Toggle layout
 [[keybind]]
 mods = ["Super"]
-key = "a"
-action = "toggle_above"
+key = "space"
+action = "toggle_layout"
+
+# Run prompt
+[[keybind]]
+mods = ["Super"]
+key = "r"
+action = "run_prompt"
+
+# Screenshot
+[[keybind]]
+key = "F12"
+action = "spawn"
+args = "flameshot gui -p $HOME"
+
+[[keybind]]
+mods = ["Shift"]
+key = "F12"
+action = "spawn"
+args = "flameshot full -p $HOME"
+
+# Screenshot (Print Screen)
+[[keybind]]
+key = "Print"
+action = "spawn"
+args = "flameshot gui -p $HOME"
+
+# Volume (PipeWire/WirePlumber via wpctl; fires bar notification)
+[[keybind]]
+mods = ["Super"]
+key = "Up"
+action = "volume_up"
+
+[[keybind]]
+mods = ["Super"]
+key = "Down"
+action = "volume_down"
+
+[[keybind]]
+mods = ["Super"]
+key = "m"
+action = "volume_mute"
+
+[[keybind]]
+key = "XF86AudioMute"
+action = "volume_mute"
+
+[[keybind]]
+key = "XF86AudioRaiseVolume"
+action = "volume_up"
+
+[[keybind]]
+key = "XF86AudioLowerVolume"
+action = "volume_down"
+
+[[keybind]]
+key = "XF86AudioMicMute"
+action = "volume_mic_mute"
+
+# Brightness (xbacklight; fires bar notification)
+[[keybind]]
+key = "XF86MonBrightnessUp"
+action = "brightness_up"
+
+[[keybind]]
+key = "XF86MonBrightnessDown"
+action = "brightness_down"
+
+# Media (playerctl; fires bar notification)
+[[keybind]]
+key = "XF86AudioPlay"
+action = "media_play_pause"
+
+[[keybind]]
+key = "XF86AudioNext"
+action = "media_next"
+
+[[keybind]]
+key = "XF86AudioPrev"
+action = "media_prev"

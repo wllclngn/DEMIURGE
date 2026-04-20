@@ -1,4 +1,4 @@
-// Landlock filesystem sandbox for gordian_knot.
+// Landlock filesystem sandbox for GORDIAN KNOT.
 //
 // Raw landlock_create_ruleset/landlock_add_rule/landlock_restrict_self via
 // libc::syscall. No helper crate. Pattern lifted from ABRAXAS's landlock.rs.

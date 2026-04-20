@@ -1,7 +1,7 @@
 // Idle-watcher daemon. Runs as a persistent user process (systemd user
 // service). Polls XScreenSaver every 5 seconds; when idle_ms exceeds the
 // configured threshold AND no D-Bus inhibitor holds "idle", spawns
-// gordian_knot (this same binary, without --daemon) to perform the lock.
+// `gordian_knot` (this same binary, without --daemon) to perform the lock.
 //
 // Rationale: forking a fresh child per lock keeps the daemon tiny and means
 // each lock session gets its own sandboxed process lifecycle. The daemon

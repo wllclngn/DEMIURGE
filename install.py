@@ -29,7 +29,7 @@ INSTALL_CONFIG_DIR = Path.home() / ".config/demiurge"
 INSTALL_CONFIG = INSTALL_CONFIG_DIR / "config.toml"
 BUILD_DIR = Path("/tmp/demiurge-build")
 
-# gordian_knot -- VT + X11 screen locker. Binary is setuid-root so the VT
+# GORDIAN KNOT -- VT + X11 screen locker. Binary is setuid-root so the VT
 # path can drive VT_LOCKSWITCH. PAM service file tells libpam which stack
 # to consult. Two user-level systemd units: daemon (idle watcher) + sleep
 # (lock before suspend).
@@ -37,6 +37,70 @@ INSTALL_GK_BINARY = Path("/usr/local/bin/gordian_knot")
 INSTALL_GK_PAM = Path("/etc/pam.d/gordian_knot")
 INSTALL_GK_DAEMON_SERVICE = Path.home() / ".config/systemd/user/gordian_knot-daemon.service"
 INSTALL_GK_SLEEP_SERVICE = Path.home() / ".config/systemd/user/gordian_knot-sleep.service"
+
+
+# EMBEDDED FILE CONTENTS
+#
+# .desktop and .service files are small, declarative, and only ever read
+# by this installer. Keeping them as separate static files in the source
+# tree means every sync / copy / branch switch can desync them -- which
+# already bit us once (demiurge.desktop went missing from the deploy
+# copy between v0.3.0 and v0.4.0). Inlined here, install.py is the
+# single source of truth; the repo loses four ghost files.
+
+DEMIURGE_DESKTOP_CONTENT = """\
+[Desktop Entry]
+Name=DEMIURGE
+Comment=Minimal X11 window manager
+Exec=systemctl --user start --wait demiurge.service
+TryExec=/usr/local/bin/demiurge
+Type=Application
+DesktopNames=DEMIURGE
+"""
+
+DEMIURGE_SERVICE_CONTENT = """\
+[Unit]
+Description=DEMIURGE X11 window manager
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/demiurge
+Restart=no
+# Prefer X11 for Chromium/Electron children so they don't try Wayland
+# and exit when no $WAYLAND_DISPLAY is present.
+Environment=OZONE_PLATFORM=x11
+"""
+
+GK_DAEMON_SERVICE_CONTENT = """\
+[Unit]
+Description=GORDIAN KNOT idle watcher
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/gordian_knot --daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+GK_SLEEP_SERVICE_CONTENT = """\
+[Unit]
+Description=Lock the session before suspend (GORDIAN KNOT)
+Before=sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+[Service]
+Type=forking
+Environment=XDG_SESSION_TYPE=x11
+ExecStart=/usr/local/bin/gordian_knot
+TimeoutStartSec=10
+
+[Install]
+WantedBy=sleep.target suspend.target hibernate.target hybrid-sleep.target
+"""
 
 
 # LOGGING
@@ -72,6 +136,61 @@ def run_cmd_capture(cmd: list, cwd: Path | None = None) -> tuple[int, str, str]:
 
 def run_cmd_sudo(cmd: list) -> int:
     return run_cmd(["sudo"] + cmd)
+
+
+def atomic_sudo_install(flags: list, src: Path, dst: Path) -> int:
+    """Atomic binary install. GNU `install` opens with O_TRUNC and is not
+    interrupt-safe: a SIGKILL between open and write leaves a 0-byte stub
+    where the working binary used to be. That has burned us (GORDIAN KNOT
+    auto-lock fired mid-install, user force-rebooted, returned to empty
+    /usr/local/bin/demiurge).
+
+    We write to <dst>.new, then rename. Rename within the same filesystem
+    is atomic -- crash between the two steps leaves <dst> untouched and a
+    stale <dst>.new alongside, which the next install overwrites."""
+    staging = Path(str(dst) + ".new")
+    ret = run_cmd_sudo(["install"] + flags + [str(src), str(staging)])
+    if ret != 0:
+        return ret
+    return run_cmd_sudo(["mv", "-f", str(staging), str(dst)])
+
+
+def atomic_write_user_file(dst: Path, content: str) -> bool:
+    """Write a user-owned file atomically via staging + rename. Creates
+    the parent dir if needed. Returns True on success."""
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(str(dst) + ".new")
+        staging.write_text(content)
+        os.replace(staging, dst)
+        return True
+    except OSError as e:
+        log_error(f"write {dst}: {e}")
+        return False
+
+
+def atomic_write_root_file(dst: Path, content: str, mode: str = "0644") -> bool:
+    """Write a root-owned file atomically. Uses `sudo install` to place
+    the content at <dst>.new with the requested mode, then renames. The
+    content is piped through `sudo tee` into the staging path."""
+    staging = Path(str(dst) + ".new")
+    try:
+        run_cmd_sudo(["mkdir", "-p", str(dst.parent)])
+        proc = subprocess.Popen(
+            ["sudo", "tee", str(staging)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        )
+        proc.communicate(input=content.encode("utf-8"))
+        if proc.returncode != 0:
+            return False
+    except OSError as e:
+        log_error(f"write {staging}: {e}")
+        return False
+    if run_cmd_sudo(["chmod", mode, str(staging)]) != 0:
+        return False
+    if run_cmd_sudo(["mv", "-f", str(staging), str(dst)]) != 0:
+        return False
+    return True
 
 
 def systemctl_user(*args: str) -> int:
@@ -146,8 +265,6 @@ def cmd_install(args, source_dir: Path) -> bool:
     log_info("Installing DEMIURGE")
 
     source_binary = BUILD_DIR / "release" / "demiurge"
-    source_service = source_dir / "demiurge.service"
-    source_desktop = source_dir / "demiurge.desktop"
     source_config = source_dir / "config.default.toml"
 
     if not build_demiurge(source_dir):
@@ -186,28 +303,23 @@ def cmd_install(args, source_dir: Path) -> bool:
         log_warn("config.default.toml not found in source")
 
     log_info(f"Installing binary: {INSTALL_BINARY}")
-    ret = run_cmd_sudo(["install", "-Dm755", str(source_binary), str(INSTALL_BINARY)])
+    ret = atomic_sudo_install(["-Dm755"], source_binary, INSTALL_BINARY)
     if ret != 0:
         log_error("Failed to install binary")
         return False
 
-    if source_desktop.exists():
-        log_info(f"Installing xsession entry: {INSTALL_DESKTOP}")
-        ret = run_cmd_sudo(["install", "-Dm644", str(source_desktop), str(INSTALL_DESKTOP)])
-        if ret != 0:
-            log_error("Failed to install xsessions entry")
-            return False
-    else:
-        log_warn("demiurge.desktop not found in source")
+    log_info(f"Installing xsession entry: {INSTALL_DESKTOP}")
+    if not atomic_write_root_file(INSTALL_DESKTOP, DEMIURGE_DESKTOP_CONTENT, "0644"):
+        log_error("Failed to install xsession entry")
+        return False
 
-    if source_service.exists():
-        log_info(f"Installing systemd unit: {INSTALL_SERVICE}")
-        shutil.copy2(source_service, INSTALL_SERVICE)
-        systemctl_user("daemon-reload")
-    else:
-        log_warn("demiurge.service not found in source")
+    log_info(f"Installing systemd unit: {INSTALL_SERVICE}")
+    if not atomic_write_user_file(INSTALL_SERVICE, DEMIURGE_SERVICE_CONTENT):
+        log_error("Failed to install systemd unit")
+        return False
+    systemctl_user("daemon-reload")
 
-    # gordian_knot (screen locker). Binary is setuid-root so it can drive
+    # GORDIAN KNOT (screen locker). Binary is setuid-root so it can drive
     # VT_LOCKSWITCH when the X11 grab fallback fires. PAM stack file under
     # /etc/pam.d. Two user systemd units: daemon (idle watcher) + sleep
     # (lock before suspend).
@@ -230,25 +342,23 @@ def cmd_install(args, source_dir: Path) -> bool:
 
 
 def install_gordian_knot(source_dir: Path, args) -> bool:
-    """Install the gordian_knot binary, PAM file, and systemd units."""
+    """Install the GORDIAN KNOT binary, PAM file, and systemd units."""
     source_gk_binary = BUILD_DIR / "release" / "gordian_knot"
-    source_daemon_svc = source_dir / "gordian_knot-daemon.service"
-    source_sleep_svc = source_dir / "gordian_knot-sleep.service"
 
     if not source_gk_binary.exists():
-        log_warn("gordian_knot binary not found; skipping locker install")
+        log_warn("GORDIAN KNOT binary not found; skipping locker install")
         return True
 
     # Binary: setuid-root (mode 4755) so VT ioctls work from an unprivileged
     # invocation. The binary itself drops privs via setresuid before running
     # PAM + UI; root is held only for VT_LOCKSWITCH.
     log_info(f"Installing locker: {INSTALL_GK_BINARY} (setuid-root)")
-    ret = run_cmd_sudo(
-        ["install", "-Dm4755", "-o", "root", "-g", "root",
-         str(source_gk_binary), str(INSTALL_GK_BINARY)]
+    ret = atomic_sudo_install(
+        ["-Dm4755", "-o", "root", "-g", "root"],
+        source_gk_binary, INSTALL_GK_BINARY,
     )
     if ret != 0:
-        log_error("Failed to install gordian_knot binary")
+        log_error("Failed to install GORDIAN KNOT binary")
         return False
 
     # PAM stack file. Minimal -- delegate to system-auth for the real
@@ -258,37 +368,39 @@ def install_gordian_knot(source_dir: Path, args) -> bool:
         log_error("Failed to install PAM stack file")
         return False
 
-    # Daemon service (user). Runs the idle watcher; respawns gordian_knot
+    # Daemon service (user). Runs the idle watcher; respawns GORDIAN KNOT
     # on threshold crossings.
-    if source_daemon_svc.exists():
-        log_info(f"Installing idle-daemon unit: {INSTALL_GK_DAEMON_SERVICE}")
-        INSTALL_GK_DAEMON_SERVICE.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_daemon_svc, INSTALL_GK_DAEMON_SERVICE)
-    else:
-        log_warn("gordian_knot-daemon.service not found in source")
+    log_info(f"Installing idle-daemon unit: {INSTALL_GK_DAEMON_SERVICE}")
+    if not atomic_write_user_file(INSTALL_GK_DAEMON_SERVICE, GK_DAEMON_SERVICE_CONTENT):
+        log_error("Failed to install idle-daemon unit")
+        return False
 
     # Sleep hook (user). Locks before suspend.target so the unlock screen
     # on resume is ours, not the display manager's.
-    if source_sleep_svc.exists():
-        log_info(f"Installing sleep-hook unit: {INSTALL_GK_SLEEP_SERVICE}")
-        shutil.copy2(source_sleep_svc, INSTALL_GK_SLEEP_SERVICE)
-    else:
-        log_warn("gordian_knot-sleep.service not found in source")
+    log_info(f"Installing sleep-hook unit: {INSTALL_GK_SLEEP_SERVICE}")
+    if not atomic_write_user_file(INSTALL_GK_SLEEP_SERVICE, GK_SLEEP_SERVICE_CONTENT):
+        log_error("Failed to install sleep-hook unit")
+        return False
 
+    # Force-disable the locker services, regardless of their prior state.
+    # Reason: GORDIAN KNOT's PAM conversation has a re-entry bug -- after
+    # a wrong password, the prompt refuses further input and the user is
+    # locked out until a force-reboot. Auto-enabling the idle-watcher
+    # has burned the user once already (mid-install auto-lock + lockout
+    # + 0-byte binaries after force-reboot). Upgrades from a version
+    # where the daemon was previously enabled would otherwise inherit
+    # the enabled state silently.
+    #
+    # Re-enable manually once the PAM bug is fixed:
+    #   systemctl --user enable --now gordian_knot-daemon.service
+    #   systemctl --user enable --now gordian_knot-sleep.service
+    for unit in ("gordian_knot-daemon.service", "gordian_knot-sleep.service"):
+        systemctl_user("disable", "--now", unit)
     systemctl_user("daemon-reload")
 
-    # Prompt to enable services unless --yes or non-interactive.
-    if getattr(args, "yes", False):
-        _enable_gordian_services()
-    elif sys.stdin.isatty():
-        try:
-            resp = input(
-                "Enable gordian_knot idle + sleep services now? [Y/n]: "
-            ).strip().lower()
-            if resp in ("", "y", "yes"):
-                _enable_gordian_services()
-        except EOFError:
-            pass
+    log_warn("GORDIAN KNOT services installed but force-disabled.")
+    log_warn("See the comment in install.py::install_gordian_knot; re-enable")
+    log_warn("manually once the PAM re-entry bug is fixed.")
     return True
 
 
@@ -308,12 +420,6 @@ def write_pam_file_as_root(path: Path, content: str) -> bool:
     # Ensure mode 0644 (tee may leave 0666 via umask).
     run_cmd_sudo(["chmod", "0644", str(path)])
     return True
-
-
-def _enable_gordian_services() -> None:
-    """Enable + start the two user units. Silent-best-effort."""
-    for unit in ("gordian_knot-daemon.service", "gordian_knot-sleep.service"):
-        systemctl_user("enable", "--now", unit)
 
 
 def cmd_update(args, source_dir: Path) -> bool:
@@ -344,18 +450,18 @@ def cmd_update(args, source_dir: Path) -> bool:
 
     source_binary = BUILD_DIR / "release" / "demiurge"
     log_info(f"Installing binary: {INSTALL_BINARY}")
-    ret = run_cmd_sudo(["install", "-Dm755", str(source_binary), str(INSTALL_BINARY)])
+    ret = atomic_sudo_install(["-Dm755"], source_binary, INSTALL_BINARY)
     if ret != 0:
         log_error("Failed to install binary")
         return False
 
-    # Refresh service file if source is newer
-    source_service = source_dir / "demiurge.service"
-    if source_service.exists() and INSTALL_SERVICE.exists():
-        if source_service.stat().st_mtime > INSTALL_SERVICE.stat().st_mtime:
-            log_info(f"Refreshing systemd unit: {INSTALL_SERVICE}")
-            shutil.copy2(source_service, INSTALL_SERVICE)
-            systemctl_user("daemon-reload")
+    # Always rewrite the service file so bug fixes / embedded-content
+    # edits in this installer take effect on update. Cheap and atomic.
+    log_info(f"Refreshing systemd unit: {INSTALL_SERVICE}")
+    if not atomic_write_user_file(INSTALL_SERVICE, DEMIURGE_SERVICE_CONTENT):
+        log_error("Failed to refresh systemd unit")
+        return False
+    systemctl_user("daemon-reload")
 
     log_info("Update complete")
     log_info("Restart your session to pick up the new binary.")
@@ -367,7 +473,7 @@ def cmd_uninstall(args, source_dir: Path) -> bool:
 
     removed = False
 
-    # Stop gordian_knot user units first so daemon-reload picks up removal.
+    # Stop GORDIAN KNOT user units first so daemon-reload picks up removal.
     for unit in ("gordian_knot-daemon.service", "gordian_knot-sleep.service"):
         systemctl_user("disable", "--now", unit)
 

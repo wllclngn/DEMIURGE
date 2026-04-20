@@ -130,6 +130,8 @@ fn all_actions_valid() {
         ("quit", None),
         ("mru_next", None),
         ("mru_prev", None),
+        ("mru_next_global", None),
+        ("mru_prev_global", None),
         ("view_tag", Some("1")),
         ("view_prev_tag", None),
         ("view_next_tag", None),
@@ -138,6 +140,15 @@ fn all_actions_valid() {
         ("toggle_fullscreen", None),
         ("toggle_layout", None),
         ("run_prompt", None),
+        ("volume_up", None),
+        ("volume_down", None),
+        ("volume_mute", None),
+        ("volume_mic_mute", None),
+        ("brightness_up", None),
+        ("brightness_down", None),
+        ("media_play_pause", None),
+        ("media_next", None),
+        ("media_prev", None),
     ];
 
     for (action, args) in &actions {
@@ -275,4 +286,61 @@ default_layout = "spiral"
 "##;
     let err = parse_config(toml).unwrap_err();
     assert!(err.contains("unknown layout"));
+}
+
+#[test]
+fn tagged_spawn_parses() {
+    let toml = r##"
+[general]
+tags = ["X", "Y", "Z"]
+
+[[startup.spawn]]
+cmd = "kitty"
+tag = "X"
+
+[[startup.spawn]]
+cmd = "kitty --class montauk-term -e montauk"
+tag = "Z"
+class = "montauk-term"
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+
+    let paths = demiurge::config::Paths::with_config(path);
+    let cfg = demiurge::config::load(&paths).unwrap();
+
+    assert_eq!(cfg.startup.spawn.len(), 2);
+    assert_eq!(cfg.startup.spawn[0].cmd, "kitty");
+    assert_eq!(cfg.startup.spawn[0].tag, "X");
+    assert_eq!(cfg.startup.spawn[0].class_match(), "kitty");
+    assert_eq!(cfg.startup.spawn[1].class_match(), "montauk-term");
+}
+
+#[test]
+fn tagged_spawn_rejects_unknown_tag() {
+    let toml = r##"
+[general]
+tags = ["X", "Y"]
+
+[[startup.spawn]]
+cmd = "kitty"
+tag = "Q"
+"##;
+    let err = parse_config(toml).unwrap_err();
+    assert!(err.contains("not in general.tags"));
+}
+
+#[test]
+fn tagged_spawn_rejects_empty_cmd() {
+    let toml = r##"
+[general]
+tags = ["X"]
+
+[[startup.spawn]]
+cmd = ""
+tag = "X"
+"##;
+    let err = parse_config(toml).unwrap_err();
+    assert!(err.contains("cmd must not be empty"));
 }

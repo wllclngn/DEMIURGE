@@ -50,7 +50,17 @@ fn on_map_request(wm: &mut Wm, ev: MapRequestEvent) {
 
     wm.manage(ev.window);
 
-    let _ = wm.conn.map_window(ev.window);
+    // Only map the window if it landed on the active tag. Tag-targeted
+    // spawns may route a new window to a background tag — leave those
+    // unmapped until the user views the target tag.
+    let on_active_tag = wm
+        .clients
+        .iter()
+        .find(|c| c.window == ev.window)
+        .map_or(true, |c| c.tag == wm.active_tag);
+    if on_active_tag {
+        let _ = wm.conn.map_window(ev.window);
+    }
     let _ = wm.conn.flush();
 }
 

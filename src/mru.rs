@@ -3,91 +3,113 @@ use x11rb::protocol::xproto::*;
 
 use crate::wm::Wm;
 
-// Marker: presence in wm.mru_cycle means the keyboard is grabbed and the
-// user is mid Alt+Tab. Cycle stepping mutates wm.history/wm.future directly,
-// so the focus_window history-push path must be skipped while this is set.
+// Cyclical MRU ring. `wm.mru` holds all focusable windows in most-recently-
+// used order, with mru[0] = current focus. Each window appears exactly once.
+//
+// Cycling: while `wm.mru_cycle` is Some, the keyboard is grabbed and
+// `index` points at the currently-raised cycle target within `candidates`.
+// The ring is NOT reordered during cycling; the selection is committed on
+// modifier release by moving candidates[index] to the front of wm.mru via
+// the normal on_focus path.
+//
+// Two scopes:
+//   CycleScope::Tag  -- candidates restricted to the active tag. Drives
+//                       Alt+Tab / Alt+` (per-tag window cycling).
+//   CycleScope::All  -- candidates = full mru ring. Drives Super+Tab
+//                       (cross-tag cycling; tag switch happens as needed).
+#[derive(Debug, Clone, Copy)]
+pub enum CycleScope {
+    Tag,
+    All,
+}
+
 #[derive(Debug)]
-pub struct CycleState;
+pub struct CycleState {
+    pub candidates: Vec<Window>,
+    pub index: usize,
+}
 
-// Scrub a destroyed window from both navigation stacks.
+// Promote a window to the front of the ring. Existing occurrences are
+// removed so each window appears exactly once.
+pub fn on_focus(wm: &mut Wm, window: Window) {
+    wm.mru.retain(|&w| w != window);
+    wm.mru.insert(0, window);
+}
+
+// Window destroyed: remove from ring.
 pub fn on_unmanage(wm: &mut Wm, gone: Window) {
-    wm.history.retain(|&w| w != gone);
-    wm.future.retain(|&w| w != gone);
+    wm.mru.retain(|&w| w != gone);
 }
 
-pub fn start_or_advance(wm: &mut Wm, forward: bool) {
-    if wm.mru_cycle.is_some() {
-        if forward {
-            step_forward(wm);
-        } else {
-            step_back(wm);
+// Cycle press. `forward` advances toward older windows; backward walks
+// toward newer. Wraps both ways. `scope` chooses Tag-only or all windows.
+pub fn start_or_advance(wm: &mut Wm, forward: bool, scope: CycleScope) {
+    let (candidates, index) = match wm.mru_cycle.take() {
+        Some(cur) => {
+            // Continuing an active cycle: advance the index against the
+            // candidate list we froze on first press. This keeps cycling
+            // stable even if the ring were mutated mid-cycle.
+            let len = cur.candidates.len();
+            if len < 2 {
+                wm.mru_cycle = Some(cur);
+                return;
+            }
+            let next_index = if forward {
+                (cur.index + 1) % len
+            } else {
+                (cur.index + len - 1) % len
+            };
+            (cur.candidates, next_index)
         }
-        return;
-    }
+        None => {
+            // First press: compute candidates under the requested scope.
+            let candidates: Vec<Window> = match scope {
+                CycleScope::All => wm.mru.clone(),
+                CycleScope::Tag => wm
+                    .mru
+                    .iter()
+                    .copied()
+                    .filter(|&w| {
+                        wm.clients
+                            .iter()
+                            .any(|c| c.window == w && c.tag == wm.active_tag)
+                    })
+                    .collect(),
+            };
+            if candidates.len() < 2 {
+                return;
+            }
 
-    // First press: refuse if there is nothing to step toward
-    let empty = if forward {
-        wm.future.is_empty()
-    } else {
-        wm.history.is_empty()
+            // Grab the keyboard so we see the modifier release.
+            let result = wm.conn.grab_keyboard(
+                true,
+                wm.root,
+                x11rb::CURRENT_TIME,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
+            let ok = result
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some_and(|r| r.status == GrabStatus::SUCCESS);
+            if !ok {
+                return;
+            }
+            // candidates[0] is the current focus (it's the most-recent
+            // entry in the mru ring, post-filter). First forward step
+            // lands on [1]; first backward step lands on the tail.
+            let next_index = if forward { 1 } else { candidates.len() - 1 };
+            (candidates, next_index)
+        }
     };
-    if empty {
-        return;
-    }
 
-    // Grab the keyboard so we receive Alt release reliably
-    let result = wm.conn.grab_keyboard(
-        true,
-        wm.root,
-        x11rb::CURRENT_TIME,
-        GrabMode::ASYNC,
-        GrabMode::ASYNC,
-    );
-    let ok = result
-        .ok()
-        .and_then(|c| c.reply().ok())
-        .is_some_and(|r| r.status == GrabStatus::SUCCESS);
-    if !ok {
-        return;
-    }
-
-    wm.mru_cycle = Some(CycleState);
-
-    if forward {
-        step_forward(wm);
-    } else {
-        step_back(wm);
-    }
-}
-
-// Alt+Tab one step into the past:
-//   future.push(current); current = history.pop()
-fn step_back(wm: &mut Wm) {
-    let target = match wm.history.pop() {
-        Some(t) => t,
-        None => return,
-    };
-    if let Some(cur) = wm.focus {
-        wm.future.push(cur);
-    }
+    let target = candidates[index];
+    wm.mru_cycle = Some(CycleState { candidates, index });
     focus_target(wm, target);
 }
 
-// Alt+Shift+Tab one step into the future (only meaningful after walking back):
-//   history.push(current); current = future.pop()
-fn step_forward(wm: &mut Wm) {
-    let target = match wm.future.pop() {
-        Some(t) => t,
-        None => return,
-    };
-    if let Some(cur) = wm.focus {
-        wm.history.push(cur);
-    }
-    focus_target(wm, target);
-}
-
-// Switch tags if needed, then focus the target. focus_window's history push
-// is suppressed because mru_cycle is Some.
+// Switch tags if needed, then focus the target. focus_window suppresses
+// its on_focus promotion because mru_cycle is Some.
 fn focus_target(wm: &mut Wm, target: Window) {
     let target_tag = wm.clients.iter().find(|c| c.window == target).map(|c| c.tag);
     if let Some(t) = target_tag
@@ -101,7 +123,12 @@ fn focus_target(wm: &mut Wm, target: Window) {
 pub fn finish_cycle(wm: &mut Wm) {
     let _ = wm.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
     let _ = wm.conn.flush();
-    wm.mru_cycle = None;
+    // Commit: promote the cycle target to the front of the ring.
+    if let Some(cycle) = wm.mru_cycle.take() {
+        if let Some(&target) = cycle.candidates.get(cycle.index) {
+            on_focus(wm, target);
+        }
+    }
 }
 
 pub fn on_key_release(wm: &mut Wm, ev: &KeyReleaseEvent) {

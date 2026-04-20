@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod atoms;
 pub mod bar;
 pub mod config;

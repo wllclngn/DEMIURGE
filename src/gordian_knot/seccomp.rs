@@ -1,4 +1,4 @@
-// seccomp-bpf syscall allowlist for gordian_knot's unprivileged child.
+// seccomp-bpf syscall allowlist for GORDIAN KNOT's unprivileged child.
 //
 // Raw BPF + prctl(PR_SET_SECCOMP). No libseccomp. Pattern lifted from
 // ABRAXAS's seccomp.rs; allowlist trimmed to what a locker needs.

@@ -30,9 +30,13 @@ pub struct Config {
     pub bar: Bar,
     #[serde(default)]
     pub startup: Startup,
+    #[serde(default)]
+    pub cursor: Cursor,
+    #[serde(default)]
+    pub font: Font,
     #[serde(default, rename = "keybind")]
     pub keybinds: Vec<Keybind>,
-    // Used by the gordian_knot binary, not demiurge itself. Dead-code
+    // Used by the GORDIAN KNOT binary, not DEMIURGE itself. Dead-code
     // analysis runs per-binary and flags it here.
     #[allow(dead_code)]
     #[serde(default)]
@@ -79,6 +83,8 @@ pub struct Bar {
     pub tag_occupied_fg: String,
     #[serde(default = "default_tag_empty_fg")]
     pub tag_empty_fg: String,
+    #[serde(default = "default_notification_fg")]
+    pub notification_fg: String,
 }
 
 impl Default for Bar {
@@ -93,25 +99,42 @@ impl Default for Bar {
             tag_focused_fg: default_tag_focused_fg(),
             tag_occupied_fg: default_tag_occupied_fg(),
             tag_empty_fg: default_tag_empty_fg(),
+            notification_fg: default_notification_fg(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Startup {
     #[serde(default)]
     pub commands: Vec<String>,
+    #[serde(default)]
+    pub spawn: Vec<TaggedSpawn>,
 }
 
-impl Default for Startup {
-    fn default() -> Self {
-        Self {
-            commands: Vec::new(),
-        }
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaggedSpawn {
+    pub cmd: String,
+    pub tag: String,
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
+impl TaggedSpawn {
+    // WM_CLASS match: explicit config field, or first whitespace-separated
+    // token of the command line.
+    pub fn class_match(&self) -> String {
+        self.class.clone().unwrap_or_else(|| {
+            self.cmd
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
     }
 }
 
-// Consumed by the gordian_knot binary. demiurge itself doesn't read these,
+// Consumed by the GORDIAN KNOT binary. DEMIURGE itself doesn't read these,
 // so per-binary dead-code analysis would otherwise flag every field.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -139,6 +162,37 @@ impl Default for GordianKnot {
             font: default_gk_font(),
             idle_timeout_seconds: default_gk_idle_timeout(),
             prompt: default_gk_prompt(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Cursor {
+    #[serde(default = "default_cursor_theme")]
+    pub theme: String,
+    #[serde(default = "default_cursor_size")]
+    pub size: u32,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            theme: default_cursor_theme(),
+            size: default_cursor_size(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Font {
+    #[serde(default = "default_font_family")]
+    pub default: String,
+}
+
+impl Default for Font {
+    fn default() -> Self {
+        Self {
+            default: default_font_family(),
         }
     }
 }
@@ -190,6 +244,18 @@ fn default_tag_occupied_fg() -> String {
 fn default_tag_empty_fg() -> String {
     "#555555".into()
 }
+fn default_notification_fg() -> String {
+    "#e5a93d".into()
+}
+fn default_cursor_theme() -> String {
+    "default".into()
+}
+fn default_cursor_size() -> u32 {
+    24
+}
+fn default_font_family() -> String {
+    "Noto Sans 9".into()
+}
 fn default_gk_bg() -> String {
     "#121212".into()
 }
@@ -235,6 +301,18 @@ pub fn load(paths: &Paths) -> Result<Config, String> {
         other => return Err(format!("general.default_layout: unknown layout '{}'", other)),
     }
 
+    for (i, sp) in config.startup.spawn.iter().enumerate() {
+        if !config.general.tags.iter().any(|t| t == &sp.tag) {
+            return Err(format!(
+                "startup.spawn[{}]: tag '{}' not in general.tags",
+                i, sp.tag
+            ));
+        }
+        if sp.cmd.trim().is_empty() {
+            return Err(format!("startup.spawn[{}]: cmd must not be empty", i));
+        }
+    }
+
     for (i, kb) in config.keybinds.iter().enumerate() {
         for m in &kb.mods {
             match m.as_str() {
@@ -250,10 +328,13 @@ pub fn load(paths: &Paths) -> Result<Config, String> {
 
 fn validate_action(action: &str, idx: usize) -> Result<(), String> {
     match action {
-        "spawn" | "close_window" | "quit" | "mru_next" | "mru_prev" | "view_tag"
+        "spawn" | "close_window" | "quit" | "mru_next" | "mru_prev"
+        | "mru_next_global" | "mru_prev_global" | "view_tag"
         | "view_prev_tag" | "view_next_tag" | "move_to_tag" | "toggle_above"
         | "toggle_fullscreen" | "toggle_layout" | "run_prompt" | "screenshot"
-        | "lock" => Ok(()),
+        | "lock" | "volume_up" | "volume_down" | "volume_mute" | "volume_mic_mute"
+        | "brightness_up" | "brightness_down" | "media_play_pause" | "media_next"
+        | "media_prev" => Ok(()),
         _ => Err(format!("keybind[{}]: unknown action '{}'", idx, action)),
     }
 }

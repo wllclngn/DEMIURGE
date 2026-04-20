@@ -12,6 +12,8 @@ pub enum Action {
     Quit,
     MruNext,
     MruPrev,
+    MruNextGlobal,
+    MruPrevGlobal,
     ViewTag(usize),
     ViewPrevTag,
     ViewNextTag,
@@ -22,6 +24,17 @@ pub enum Action {
     RunPrompt,
     Screenshot,
     Lock,
+    // System controls. Each one shells out to its CLI (wpctl, xbacklight,
+    // playerctl), reads the new state, and fires a bar notification.
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
+    VolumeMicMute,
+    BrightnessUp,
+    BrightnessDown,
+    MediaPlayPause,
+    MediaNext,
+    MediaPrev,
 }
 
 // A resolved keybinding: keycode + modifier mask -> action
@@ -205,6 +218,8 @@ fn parse_action(action: &str, args: &Option<String>, idx: usize) -> Result<Actio
         "quit" => Ok(Action::Quit),
         "mru_next" => Ok(Action::MruNext),
         "mru_prev" => Ok(Action::MruPrev),
+        "mru_next_global" => Ok(Action::MruNextGlobal),
+        "mru_prev_global" => Ok(Action::MruPrevGlobal),
         "view_tag" => {
             let n: usize = args
                 .as_ref()
@@ -229,6 +244,15 @@ fn parse_action(action: &str, args: &Option<String>, idx: usize) -> Result<Actio
         "run_prompt" => Ok(Action::RunPrompt),
         "screenshot" => Ok(Action::Screenshot),
         "lock" => Ok(Action::Lock),
+        "volume_up" => Ok(Action::VolumeUp),
+        "volume_down" => Ok(Action::VolumeDown),
+        "volume_mute" => Ok(Action::VolumeMute),
+        "volume_mic_mute" => Ok(Action::VolumeMicMute),
+        "brightness_up" => Ok(Action::BrightnessUp),
+        "brightness_down" => Ok(Action::BrightnessDown),
+        "media_play_pause" => Ok(Action::MediaPlayPause),
+        "media_next" => Ok(Action::MediaNext),
+        "media_prev" => Ok(Action::MediaPrev),
         _ => Err(format!("keybind[{}]: unknown action '{}'", idx, action)),
     }
 }

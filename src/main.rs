@@ -1,3 +1,4 @@
+mod appearance;
 mod atoms;
 mod bar;
 mod config;
@@ -18,7 +19,7 @@ use x11rb::protocol::xproto::ConnectionExt as _;
 use std::path::PathBuf;
 
 fn main() {
-    let Args { config_path, check_config } = parse_args();
+    let Args { config_path, check_config, setup } = parse_args();
 
     let paths = match config_path {
         Some(p) => config::Paths::with_config(p),
@@ -46,6 +47,21 @@ fn main() {
         std::process::exit(0);
     }
 
+    // --setup: write ~/.gtkrc-2.0, ~/.config/gtk-3.0/settings.ini, and
+    // ~/.icons/default/index.theme from [cursor] and [font] config. Replaces
+    // lxappearance. Does not start the WM.
+    if setup {
+        if let Err(e) = appearance::write_setup_files(&cfg) {
+            eprintln!("[demiurge setup] {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // Export XCURSOR_THEME and XCURSOR_SIZE so every child inherits the
+    // configured cursor. Must happen before any spawn::spawn call.
+    appearance::apply_runtime(&cfg);
+
     let mut wm = match wm::Wm::init(&cfg) {
         Ok(wm) => wm,
         Err(e) => {
@@ -58,6 +74,28 @@ fn main() {
     for cmd in &cfg.startup.commands {
         eprintln!("[demiurge] startup: {}", cmd);
         spawn::spawn(cmd);
+    }
+
+    // Tag-targeted spawns. Each registers a pending WM_CLASS match before
+    // firing the command; Wm::manage consumes the match when the window
+    // appears and routes it to the requested tag.
+    for sp in &cfg.startup.spawn {
+        let target_tag = cfg
+            .general
+            .tags
+            .iter()
+            .position(|t| t == &sp.tag)
+            .expect("startup.spawn tag validated by config::load");
+        let class_match = sp.class_match();
+        eprintln!(
+            "[demiurge] startup spawn (class='{}', tag={}): {}",
+            class_match, target_tag, sp.cmd
+        );
+        wm.pending_spawns.push(wm::PendingSpawn {
+            class_match,
+            target_tag,
+        });
+        spawn::spawn(&sp.cmd);
     }
 
     // Setup signalfd for clean shutdown
@@ -80,11 +118,12 @@ fn main() {
 struct Args {
     config_path: Option<PathBuf>,
     check_config: bool,
+    setup: bool,
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
-    let mut out = Args { config_path: None, check_config: false };
+    let mut out = Args { config_path: None, check_config: false, setup: false };
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -100,12 +139,17 @@ fn parse_args() -> Args {
             "--check-config" => {
                 out.check_config = true;
             }
+            "--setup" => {
+                // lxappearance replacement: regenerate GTK config and
+                // ~/.icons/default/index.theme from [cursor] and [font].
+                out.setup = true;
+            }
             "-v" | "--version" => {
                 println!("demiurge {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-h" | "--help" => {
-                println!("usage: demiurge [-c config.toml] [--check-config] [-v] [-h]");
+                println!("usage: demiurge [-c config.toml] [--check-config] [--setup] [-v] [-h]");
                 std::process::exit(0);
             }
             _ => {

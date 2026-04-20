@@ -12,7 +12,7 @@
 //   VT path:    requires setuid-root at install time. Parent holds root
 //               to drive VT ioctls; child forks + drops to the invoking
 //               user before PAM + UI.
-//   Daemon:     runs as the invoking user. Spawns a fresh gordian_knot
+//   Daemon:     runs as the invoking user. Spawns a fresh `gordian_knot`
 //               (this binary, without --daemon) when the idle threshold
 //               is crossed. The respawned process picks X11 or VT itself.
 

@@ -38,6 +38,7 @@ struct BarColors {
     tag_focused_fg: (f64, f64, f64),
     tag_occupied_fg: (f64, f64, f64),
     tag_empty_fg: (f64, f64, f64),
+    notification_fg: (f64, f64, f64),
 }
 
 pub struct PromptState {
@@ -148,6 +149,7 @@ impl Bar {
             tag_focused_fg: parse_hex_local(&config.bar.tag_focused_fg),
             tag_occupied_fg: parse_hex_local(&config.bar.tag_occupied_fg),
             tag_empty_fg: parse_hex_local(&config.bar.tag_empty_fg),
+            notification_fg: parse_hex_local(&config.bar.notification_fg),
         };
 
         let path_executables = scan_path();
@@ -196,7 +198,8 @@ impl Bar {
         conn: &RustConnection,
         active_tag: usize,
         occupied: &[bool],
-        title: &str,
+        center_text: &str,
+        is_notification: bool,
         _layout: Layout,
     ) {
         for (pi, panel) in self.panels.iter().enumerate() {
@@ -302,9 +305,16 @@ impl Bar {
                 }
             }
 
-            // CLOCK (right section)
+            // CLOCK (right section). Wrap in a Pango span with
+            // font_features="tnum" so digits use tabular numerals -- the
+            // clock stops ticking-jitter when 1 -> 2 changes digit width
+            // in the default proportional font. Ported from AwesomeWM.
             let clock_text = self.format_clock();
-            layout.set_text(&clock_text);
+            let clock_markup = format!(
+                "<span font_features=\"tnum\">{}</span>",
+                escape_markup(&clock_text),
+            );
+            layout.set_markup(&clock_markup);
             let (clock_w, clock_h) = layout.pixel_size();
             let clock_x = w - clock_w - 10;
             let clock_y = (h - clock_h) / 2;
@@ -314,20 +324,36 @@ impl Bar {
             cr.move_to(clock_x as f64, clock_y as f64);
             pangocairo::functions::show_layout(&cr, &layout);
 
-            // WINDOW TITLE (center section)
-            let title_left = prompt_end_x + 20;
-            let title_right = clock_x - 20;
-            let title_avail = title_right - title_left;
+            // Clear the tnum attributes the clock's set_markup left on the
+            // shared layout so subsequent set_text calls render plainly.
+            layout.set_attributes(None);
 
-            if title_avail > 50 && !title.is_empty() {
-                layout.set_text(title);
+            // WINDOW TITLE: centered on the PANEL, not between the
+            // flankers. Max width is the largest value that keeps both
+            // edges clear of the tags/prompt area on the left and the
+            // clock on the right.
+            let panel_mid = w / 2;
+            let left_limit = prompt_end_x + 20;
+            let right_limit = clock_x - 20;
+            let left_half = panel_mid - left_limit;
+            let right_half = right_limit - panel_mid;
+            let max_half = left_half.min(right_half);
+
+            if max_half > 25 && !center_text.is_empty() {
+                let max_w = max_half * 2;
+                layout.set_text(center_text);
                 layout.set_ellipsize(pango::EllipsizeMode::End);
-                layout.set_width(title_avail * pango::SCALE);
+                layout.set_width(max_w * pango::SCALE);
                 let (text_w, text_h) = layout.pixel_size();
-                let title_x = title_left + (title_avail - text_w) / 2;
+                let title_x = panel_mid - text_w / 2;
                 let title_y = (h - text_h) / 2;
 
-                cr.set_source_rgb(fr, fg, fb);
+                let (cr_r, cr_g, cr_b) = if is_notification {
+                    self.colors.notification_fg
+                } else {
+                    self.colors.fg
+                };
+                cr.set_source_rgb(cr_r, cr_g, cr_b);
                 cr.move_to(title_x as f64, title_y as f64);
                 pangocairo::functions::show_layout(&cr, &layout);
 
@@ -387,7 +413,13 @@ impl Bar {
         });
     }
 
-    pub fn update_appearance(&mut self, config: &Config) {
+    pub fn update_appearance(
+        &mut self,
+        config: &Config,
+        conn: &RustConnection,
+        atoms: &Atoms,
+        monitors: &[Monitor],
+    ) {
         self.colors = BarColors {
             bg: parse_hex_local(&config.bar.bg),
             fg: parse_hex_local(&config.bar.fg),
@@ -395,9 +427,45 @@ impl Bar {
             tag_focused_fg: parse_hex_local(&config.bar.tag_focused_fg),
             tag_occupied_fg: parse_hex_local(&config.bar.tag_occupied_fg),
             tag_empty_fg: parse_hex_local(&config.bar.tag_empty_fg),
+            notification_fg: parse_hex_local(&config.bar.notification_fg),
         };
         self.font_desc = pango::FontDescription::from_string(&config.bar.font);
         self.clock_format = config.bar.clock_format.clone();
+
+        // Height change: reconfigure each panel window and refresh the
+        // _NET_WM_STRUT_PARTIAL so managed clients avoid the new bar area.
+        if config.bar.height != self.height {
+            let new_height = config.bar.height;
+            for (panel, mon) in self.panels.iter().zip(monitors.iter()) {
+                let _ = conn.configure_window(
+                    panel.window,
+                    &ConfigureWindowAux::new().height(new_height),
+                );
+                let strut: [u32; 12] = [
+                    0,
+                    0,
+                    new_height,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    mon.x as u32,
+                    mon.x as u32 + mon.width - 1,
+                    0,
+                    0,
+                ];
+                let _ = conn.change_property32(
+                    PropMode::REPLACE,
+                    panel.window,
+                    atoms._NET_WM_STRUT_PARTIAL,
+                    AtomEnum::CARDINAL,
+                    &strut,
+                );
+            }
+            self.height = new_height;
+            let _ = conn.flush();
+        }
     }
 
     pub fn handle_prompt_key(&mut self, keysym: u32) -> Option<String> {
@@ -460,6 +528,23 @@ pub fn parse_hex(color: &str) -> (f64, f64, f64) {
 
 fn parse_hex_local(color: &str) -> (f64, f64, f64) {
     crate::torrentius::parse_hex(color)
+}
+
+// Escape text for Pango markup so a user-chosen clock_format containing
+// &, <, or > doesn't corrupt the surrounding <span font_features="tnum">.
+fn escape_markup(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn scan_path() -> Vec<String> {

@@ -15,6 +15,26 @@ use crate::mouse::DragState;
 use crate::mru;
 use crate::spawn;
 
+// Pending tag-targeted spawn: a class to match on the next incoming window,
+// plus the tag that window should land on. FIFO consumption: first matching
+// entry wins when a window with the given class appears.
+#[derive(Debug, Clone)]
+pub struct PendingSpawn {
+    pub class_match: String,
+    pub target_tag: usize,
+}
+
+// Transient message that temporarily replaces the focused window title in
+// the bar center. Set by volume / brightness / media actions; cleared by
+// the next redraw_bar tick after expires_at.
+#[derive(Debug)]
+pub struct Notification {
+    pub text: String,
+    pub expires_at: std::time::Instant,
+}
+
+pub const NOTIFICATION_TTL_MS: u64 = 1500;
+
 // Per-client state
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -51,12 +71,13 @@ pub struct Wm {
     pub layouts: Vec<Layout>,
     pub master_ratio: f64,
     pub drag: Option<DragState>,
-    // Browser-style back/forward navigation stacks. `history` holds windows
-    // visited before `focus` (back = most recent). `future` holds windows
-    // walked past via Alt+Tab back-stepping (back = most recent forward step).
-    pub history: Vec<Window>,
-    pub future: Vec<Window>,
+    // Most-recently-used ring. mru[0] is the current focus; each window
+    // appears exactly once. Alt+Tab cycles an index into this ring without
+    // reordering it; the selection is committed on Alt release.
+    pub mru: Vec<Window>,
     pub mru_cycle: Option<mru::CycleState>,
+    pub pending_spawns: Vec<PendingSpawn>,
+    pub notification: Option<Notification>,
     pub alt_keycodes: Vec<Keycode>,
     pub keymap: keys::KeyMap,
     pub bar: Option<Bar>,
@@ -160,9 +181,10 @@ impl Wm {
             layouts,
             master_ratio,
             drag: None,
-            history: Vec::new(),
-            future: Vec::new(),
+            mru: Vec::new(),
             mru_cycle: None,
+            pending_spawns: Vec::new(),
+            notification: None,
             alt_keycodes,
             keymap,
             bar: Some(bar),
@@ -228,9 +250,22 @@ impl Wm {
         // Click-to-focus: passive Button1 grab with sync mode
         crate::mouse::grab_focus_button(&self.conn, window);
 
+        let class = self.get_class(window);
+
+        // Route to pending tag-targeted spawn if the class matches; otherwise
+        // land on the active tag. FIFO: first matching entry wins.
+        let target_tag = match self
+            .pending_spawns
+            .iter()
+            .position(|p| p.class_match == class)
+        {
+            Some(idx) => self.pending_spawns.remove(idx).target_tag,
+            None => self.active_tag,
+        };
+
         // Set frame extents (zeros -- no decorations)
         ewmh::set_frame_extents(&self.conn, window, &self.atoms);
-        ewmh::set_client_desktop(&self.conn, window, &self.atoms, self.active_tag as u32);
+        ewmh::set_client_desktop(&self.conn, window, &self.atoms, target_tag as u32);
 
         let (x, y, w, h) = self
             .conn
@@ -245,8 +280,8 @@ impl Wm {
 
         let mut client = Client {
             window,
-            tag: self.active_tag,
-            floating: should_float || self.layouts[self.active_tag] == Layout::Floating,
+            tag: target_tag,
+            floating: should_float || self.layouts[target_tag] == Layout::Floating,
             fullscreen: false,
             above: false,
             x,
@@ -269,13 +304,13 @@ impl Wm {
             client.above = true;
         }
 
-        let class = self.get_class(window);
         eprintln!(
-            "[{}] [INFO]   manage '{}' (class='{}', title='{}', geom={}x{}+{}+{})",
+            "[{}] [INFO]   manage '{}' (class='{}', title='{}', tag={}, geom={}x{}+{}+{})",
             local_time(),
             window,
             class,
             title,
+            target_tag,
             w,
             h,
             x,
@@ -303,8 +338,12 @@ impl Wm {
             );
         }
 
-        // Focus the new window
-        self.focus_window(Some(window));
+        // Focus the new window only if it landed on the currently visible
+        // tag. Cross-tag spawns (tag-targeted startup) stay in the
+        // background until the user views that tag.
+        if target_tag == self.active_tag {
+            self.focus_window(Some(window));
+        }
 
         if self.layouts[self.active_tag] != Layout::Floating {
             self.arrange();
@@ -323,17 +362,11 @@ impl Wm {
                 mru::finish_cycle(self);
             }
 
-            // If we lost focus, pick next window. Clear self.focus first so
-            // focus_window's history-push sees None and doesn't enqueue the
-            // dead window.
+            // If we lost focus, pick next window. on_unmanage scrubbed
+            // `window` from the MRU ring already, so pick_focus_for_tag
+            // naturally skips it; `exclude` is belt-and-suspenders.
             if self.focus == Some(window) {
-                let next = self
-                    .clients
-                    .iter()
-                    .rev()
-                    .find(|c| c.tag == self.active_tag)
-                    .map(|c| c.window);
-                self.focus = None;
+                let next = self.pick_focus_for_tag(self.active_tag, Some(window));
                 self.focus_window(next);
             }
 
@@ -346,17 +379,12 @@ impl Wm {
     // FOCUS
 
     pub fn focus_window(&mut self, window: Option<Window>) {
-        // Browser-style history: any direct focus change pushes the previous
-        // focus onto history and clears the future stack. Skipped during
-        // Alt+Tab cycling — cycle steps mutate the stacks directly in mru.rs.
+        // Promote target to the front of the MRU ring. Suppressed while a
+        // cycle is active — mru.rs raises the cycle target visually without
+        // reordering the ring; the commit happens in finish_cycle.
         if self.mru_cycle.is_none() {
             if let Some(target) = window {
-                if let Some(old) = self.focus {
-                    if old != target {
-                        self.history.push(old);
-                    }
-                }
-                self.future.clear();
+                mru::on_focus(self, target);
             }
         }
 
@@ -432,15 +460,38 @@ impl Wm {
             return;
         }
         self.view_tag_no_focus(tag);
-
-        // Focus topmost on new tag
-        let next = self
-            .clients
-            .iter()
-            .rev()
-            .find(|c| c.tag == tag)
-            .map(|c| c.window);
+        let next = self.pick_focus_for_tag(tag, None);
         self.focus_window(next);
+    }
+
+    // Pick the window to focus on a given tag, in priority order:
+    //   1. Most-recently-used window on that tag (via wm.mru). This is
+    //      the window the user was actually using when they last left
+    //      this tag -- the "where I left off" answer.
+    //   2. If no MRU entry matches (e.g. tag-targeted spawn that landed
+    //      on a background tag and never got focused), fall back to
+    //      most-recently-managed client on the tag (clients vector,
+    //      reverse-iterated).
+    // `exclude` drops a specific window from consideration (used by
+    // unmanage and move_to_tag to skip the window being removed).
+    fn pick_focus_for_tag(&self, tag: usize, exclude: Option<Window>) -> Option<Window> {
+        self.mru
+            .iter()
+            .copied()
+            .find(|&w| {
+                Some(w) != exclude
+                    && self
+                        .clients
+                        .iter()
+                        .any(|c| c.window == w && c.tag == tag)
+            })
+            .or_else(|| {
+                self.clients
+                    .iter()
+                    .rev()
+                    .find(|c| c.tag == tag && Some(c.window) != exclude)
+                    .map(|c| c.window)
+            })
     }
 
     pub fn view_prev_tag(&mut self) {
@@ -469,13 +520,9 @@ impl Wm {
                 if tag != self.active_tag {
                     client.unmap_ignore = client.unmap_ignore.saturating_add(1);
                     let _ = self.conn.unmap_window(win);
-                    // Focus next on current tag
-                    let next = self
-                        .clients
-                        .iter()
-                        .rev()
-                        .find(|c| c.tag == self.active_tag && c.window != win)
-                        .map(|c| c.window);
+                    // Focus next on current tag, excluding the window we
+                    // just moved off.
+                    let next = self.pick_focus_for_tag(self.active_tag, Some(win));
                     self.focus_window(next);
                 }
                 let _ = self.conn.flush();
@@ -500,8 +547,10 @@ impl Wm {
             Action::MoveToTag(t) => self.move_to_tag(*t),
             Action::ToggleAbove => self.toggle_above(),
             Action::ToggleFullscreen => self.toggle_fullscreen(),
-            Action::MruNext => crate::mru::start_or_advance(self, true),
-            Action::MruPrev => crate::mru::start_or_advance(self, false),
+            Action::MruNext => crate::mru::start_or_advance(self, true, crate::mru::CycleScope::Tag),
+            Action::MruPrev => crate::mru::start_or_advance(self, false, crate::mru::CycleScope::Tag),
+            Action::MruNextGlobal => crate::mru::start_or_advance(self, true, crate::mru::CycleScope::All),
+            Action::MruPrevGlobal => crate::mru::start_or_advance(self, false, crate::mru::CycleScope::All),
             Action::ToggleLayout => self.toggle_layout(),
             Action::RunPrompt => {
                 if let Some(ref mut bar) = self.bar {
@@ -521,6 +570,72 @@ impl Wm {
             }
             Action::Screenshot => self.screenshot(),
             Action::Lock => spawn::spawn("gordian_knot"),
+            Action::VolumeUp => self.volume_delta("5%+"),
+            Action::VolumeDown => self.volume_delta("5%-"),
+            Action::VolumeMute => self.volume_toggle_mute(false),
+            Action::VolumeMicMute => self.volume_toggle_mute(true),
+            Action::BrightnessUp => self.brightness_delta("-inc"),
+            Action::BrightnessDown => self.brightness_delta("-dec"),
+            Action::MediaPlayPause => self.media_command("play-pause"),
+            Action::MediaNext => self.media_command("next"),
+            Action::MediaPrev => self.media_command("previous"),
+        }
+    }
+
+    // Transient bar notification. Replaces the focused-window title in the
+    // bar center for NOTIFICATION_TTL_MS, rendered in bar.notification_fg.
+    pub fn notify(&mut self, text: String) {
+        self.notification = Some(Notification {
+            text,
+            expires_at: std::time::Instant::now()
+                + std::time::Duration::from_millis(NOTIFICATION_TTL_MS),
+        });
+        self.redraw_bar();
+    }
+
+    fn volume_delta(&mut self, delta: &str) {
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-volume", "@DEFAULT_AUDIO_SINK@", delta])
+            .status();
+        let value = read_wpctl_volume("@DEFAULT_AUDIO_SINK@")
+            .unwrap_or_else(|| "unknown".into());
+        self.notify(format!("NOTIFICATION: System Volume, {}.", value));
+    }
+
+    fn volume_toggle_mute(&mut self, is_mic: bool) {
+        let target = if is_mic {
+            "@DEFAULT_AUDIO_SOURCE@"
+        } else {
+            "@DEFAULT_AUDIO_SINK@"
+        };
+        let _ = std::process::Command::new("wpctl")
+            .args(["set-mute", target, "toggle"])
+            .status();
+        let value = read_wpctl_volume(target).unwrap_or_else(|| "unknown".into());
+        let label = if is_mic { "Microphone" } else { "System Volume" };
+        self.notify(format!("NOTIFICATION: {}, {}.", label, value));
+    }
+
+    fn brightness_delta(&mut self, flag: &str) {
+        let _ = std::process::Command::new("xbacklight")
+            .args([flag, "5"])
+            .status();
+        let value = read_brightness().unwrap_or_else(|| "unknown".into());
+        self.notify(format!("NOTIFICATION: Brightness, {}.", value));
+    }
+
+    fn media_command(&mut self, cmd: &str) {
+        let _ = std::process::Command::new("playerctl").arg(cmd).status();
+        match read_media_state() {
+            Some((state, Some(title))) => {
+                self.notify(format!("NOTIFICATION: {}, {}.", state, title));
+            }
+            Some((state, None)) => {
+                self.notify(format!("NOTIFICATION: {}.", state));
+            }
+            None => {
+                self.notify("NOTIFICATION: No media player.".into());
+            }
         }
     }
 
@@ -913,23 +1028,57 @@ impl Wm {
 
         self.master_ratio = config.general.master_ratio;
 
+        let old_height = self.bar_height;
         if let Some(ref mut bar) = self.bar {
-            bar.update_appearance(config);
+            bar.update_appearance(config, &self.conn, &self.atoms, &self.monitors);
+        }
+        if config.bar.height != old_height {
+            self.bar_height = config.bar.height;
+            ewmh::set_workarea(
+                &self.conn,
+                self.root,
+                &self.atoms,
+                self.num_tags as u32,
+                &self.monitors,
+                self.bar_height,
+            );
+            self.arrange();
         }
 
         self.redraw_bar();
     }
 
     pub fn redraw_bar(&mut self) {
+        // Clear expired notifications on every redraw. The 1-second
+        // timerfd tick drives redraw_bar, so notifications clear with at
+        // most ~1s overshoot.
+        if let Some(ref n) = self.notification {
+            if std::time::Instant::now() >= n.expires_at {
+                self.notification = None;
+            }
+        }
+
         let occupied: Vec<bool> = (0..self.num_tags).map(|t| self.tag_occupied(t)).collect();
-        let title = self
-            .focus
-            .and_then(|w| self.clients.iter().find(|c| c.window == w))
-            .map(|c| c.title.clone())
-            .unwrap_or_default();
+        let (center_text, is_notification) = match &self.notification {
+            Some(n) => (n.text.clone(), true),
+            None => (
+                self.focus
+                    .and_then(|w| self.clients.iter().find(|c| c.window == w))
+                    .map(|c| c.title.clone())
+                    .unwrap_or_default(),
+                false,
+            ),
+        };
         let layout = self.layouts[self.active_tag];
         if let Some(ref mut bar) = self.bar {
-            bar.draw(&self.conn, self.active_tag, &occupied, &title, layout);
+            bar.draw(
+                &self.conn,
+                self.active_tag,
+                &occupied,
+                &center_text,
+                is_notification,
+                layout,
+            );
         }
     }
 
@@ -953,6 +1102,69 @@ impl Wm {
             })
             .unwrap_or(&self.monitors[0])
     }
+}
+
+// Parse `wpctl get-volume <target>` output:
+//   "Volume: 0.50"            -> "50%"
+//   "Volume: 0.50 [MUTED]"    -> "MUTED"
+// When muted, return "MUTED" regardless of the numeric value.
+pub(crate) fn read_wpctl_volume(target: &str) -> Option<String> {
+    let out = std::process::Command::new("wpctl")
+        .args(["get-volume", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    if s.contains("[MUTED]") {
+        return Some("MUTED".into());
+    }
+    let value: f64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    Some(format!("{}%", (value * 100.0).round() as u32))
+}
+
+// Parse `xbacklight -get` output: a bare float like "60.000000".
+pub(crate) fn read_brightness() -> Option<String> {
+    let out = std::process::Command::new("xbacklight")
+        .arg("-get")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(format!("{}%", value.round() as u32))
+}
+
+// Returns (state, optional track). state is "Playing", "Paused", "Stopped".
+// track is "Title — Artist" when metadata is available. None means no
+// player is running or playerctl isn't installed.
+pub(crate) fn read_media_state() -> Option<(String, Option<String>)> {
+    let status = std::process::Command::new("playerctl")
+        .arg("status")
+        .output()
+        .ok()?;
+    if !status.status.success() {
+        return None;
+    }
+    let state = String::from_utf8_lossy(&status.stdout).trim().to_string();
+    if state.is_empty() || state == "No players found" {
+        return None;
+    }
+
+    let meta = std::process::Command::new("playerctl")
+        .args(["metadata", "--format", "{{title}} — {{artist}}"])
+        .output()
+        .ok()?;
+    let track = String::from_utf8_lossy(&meta.stdout).trim().to_string();
+    let track = if track.is_empty() || track == " — " {
+        None
+    } else {
+        Some(track)
+    };
+
+    Some((state, track))
 }
 
 pub(crate) fn local_time() -> String {

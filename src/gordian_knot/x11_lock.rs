@@ -255,7 +255,17 @@ fn on_key_press(
     let keysym = keycode_to_keysym(ev.detail, shift, keymap);
     match keysym {
         0xff0d | 0xff8d => {
-            // Return / KP_Enter -- submit.
+            // Return / KP_Enter -- submit. Gate empty passwords: the PAM
+            // stack's pam_faildelay stalls 2-3s per attempt and pam_faillock
+            // trips the account after a few failures. If the user hammers
+            // Enter on an empty buffer after a wrong attempt (which clears
+            // state.password below), we'd submit "" repeatedly and lock
+            // them out of their own account until the faillock window
+            // expires. Silently drop empty-Enter instead.
+            if state.password.is_empty() {
+                state.message = "Type your password and press Enter.".to_string();
+                return Some(LoopOutcome::Redraw);
+            }
             state.message.clear();
             match pam::authenticate(user, &state.password) {
                 Ok(()) => Some(LoopOutcome::Authenticated),
