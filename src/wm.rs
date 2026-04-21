@@ -203,7 +203,8 @@ impl Wm {
             }
         }
 
-        wm.redraw_bar();
+        // Bar is already marked all-dirty on Bar::create; the first
+        // commit in the event loop renders the initial state.
 
         eprintln!(
             "[demiurge] started (tags: {}, bindings: {}, existing: {})",
@@ -348,6 +349,11 @@ impl Wm {
         if self.layouts[self.active_tag] != Layout::Floating {
             self.arrange();
         }
+
+        // Tag-occupied state may have flipped (first window on this tag).
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_tags_dirty();
+        }
     }
 
     pub fn unmanage(&mut self, window: Window) {
@@ -372,6 +378,12 @@ impl Wm {
 
             if tag == self.active_tag && self.layouts[tag] != Layout::Floating {
                 self.arrange();
+            }
+
+            // Tag may have just emptied; tag-occupied coloring needs
+            // a refresh.
+            if let Some(ref mut bar) = self.bar {
+                bar.mark_tags_dirty();
             }
         }
     }
@@ -422,7 +434,11 @@ impl Wm {
             );
         }
 
-        self.redraw_bar();
+        // Focus changed -> title region needs to update. The event-loop
+        // commit pass picks this up.
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_title_dirty();
+        }
         let _ = self.conn.flush();
     }
 
@@ -451,6 +467,11 @@ impl Wm {
 
         if self.layouts[tag] != Layout::Floating {
             self.arrange();
+        }
+
+        // Active tag highlight changed; tag region needs a repaint.
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_tags_dirty();
         }
         let _ = self.conn.flush();
     }
@@ -565,8 +586,8 @@ impl Wm {
                         GrabMode::ASYNC,
                     );
                     bar.start_prompt();
+                    bar.mark_prompt_dirty();
                 }
-                self.redraw_bar();
             }
             Action::Screenshot => self.screenshot(),
             Action::Lock => spawn::spawn("gordian_knot"),
@@ -590,7 +611,9 @@ impl Wm {
             expires_at: std::time::Instant::now()
                 + std::time::Duration::from_millis(NOTIFICATION_TTL_MS),
         });
-        self.redraw_bar();
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_title_dirty();
+        }
     }
 
     fn volume_delta(&mut self, delta: &str) {
@@ -869,7 +892,11 @@ impl Wm {
         }
 
         self.send_wm_state(window, action, prop1, prop2);
-        self.redraw_bar();
+        // Above/fullscreen toggles don't change any bar-rendered state,
+        // but mark the title anyway in case focus subtly shifts.
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_title_dirty();
+        }
         let _ = self.conn.flush();
     }
 
@@ -1045,16 +1072,32 @@ impl Wm {
             self.arrange();
         }
 
-        self.redraw_bar();
+        // Colors/font/clock format change = full bar repaint.
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_all_dirty();
+        }
     }
 
-    pub fn redraw_bar(&mut self) {
-        // Clear expired notifications on every redraw. The 1-second
-        // timerfd tick drives redraw_bar, so notifications clear with at
-        // most ~1s overshoot.
-        if let Some(ref n) = self.notification {
-            if std::time::Instant::now() >= n.expires_at {
-                self.notification = None;
+    // Called once per event-loop iteration. Expires stale notifications
+    // (1-second timerfd tick drives this, so notifications clear with at
+    // most ~1s overshoot), then hands the current bar state to
+    // Bar::commit which renders + put_images only the regions whose
+    // dirty flags are set. Fast path: no dirty flags set, commit returns
+    // immediately.
+    //
+    // Replaces the old redraw_bar() which unconditionally did a full
+    // re-render. v0.4.1: state mutations now call bar.mark_*_dirty()
+    // and the actual X traffic happens once per event-loop iteration.
+    pub fn commit_bar(&mut self) {
+        // Notification expiry. If a notification just expired, the title
+        // region needs to be re-rendered with the focused window's title
+        // instead.
+        if let Some(ref n) = self.notification
+            && std::time::Instant::now() >= n.expires_at
+        {
+            self.notification = None;
+            if let Some(ref mut bar) = self.bar {
+                bar.mark_title_dirty();
             }
         }
 
@@ -1069,15 +1112,13 @@ impl Wm {
                 false,
             ),
         };
-        let layout = self.layouts[self.active_tag];
         if let Some(ref mut bar) = self.bar {
-            bar.draw(
+            bar.commit(
                 &self.conn,
                 self.active_tag,
                 &occupied,
                 &center_text,
                 is_notification,
-                layout,
             );
         }
     }

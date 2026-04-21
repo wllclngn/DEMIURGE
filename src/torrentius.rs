@@ -119,6 +119,12 @@ pub fn make_font_options() -> Result<cairo::FontOptions, String> {
 
 // Allocate a fresh opaque RGB24 surface + context sized to w x h pixels.
 // Returns Err on allocation failure; callers typically `continue` on err.
+//
+// Used by GORDIAN KNOT's lock screen (re-allocated per redraw because the
+// lock UI is short-lived). The DEMIURGE bar uses a pinned surface
+// allocated once in Bar::create -- per-binary dead-code analysis flags
+// this when only the bar binary is built, hence the allow.
+#[allow(dead_code)]
 pub fn new_surface(w: i32, h: i32) -> Result<(cairo::ImageSurface, cairo::Context), String> {
     let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, w, h)
         .map_err(|e| format!("cairo surface {}x{}: {}", w, h, e))?;

@@ -39,7 +39,7 @@ impl Wm {
             tag,
         );
         self.arrange();
-        self.redraw_bar();
+        // Layout name isn't displayed in the bar today; nothing to mark.
     }
 
     pub fn arrange(&mut self) {

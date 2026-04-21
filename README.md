@@ -10,7 +10,7 @@ Target: rustc 1.85+ (Rust 2024 edition). Linux only. X11 only.
 
 | Binary / module | Role |
 |---|---|
-| `demiurge` | Window manager. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar, tag-targeted startup spawns. |
+| `demiurge` | Window manager. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar, tag-targeted startup spawns, session-scoped child teardown on quit. |
 | `gordian_knot` | Screen locker + idle daemon + lock-on-suspend hook. Setuid-root with seccomp-bpf + landlock sandbox. PAM authentication via inline FFI. |
 | `torrentius` | Rendering subsystem (not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by both binaries. |
 
@@ -254,6 +254,48 @@ overshoot past TTL.
 Runtime deps for the action handlers (not enforced at build time):
 `wpctl` (wireplumber), `xbacklight`, `playerctl`.
 
+## Bar redraw (push-based, per-region atomic)
+
+Each panel owns a persistent Cairo `ImageSurface` allocated at
+`Bar::create` time (not per-draw). The panel width is partitioned
+into four non-overlapping regions:
+
+| Region | Width | Purpose |
+|---|---|---|
+| tags | measured: `TAGS_EDGE_PAD + Σ(padded tag widths) + TAGS_EDGE_PAD` | Tag labels, active highlight |
+| prompt | `PROMPT_MAX_W = 600` | Run-prompt input (only primary panel) |
+| title | remainder | Focused-window title / `NOTIFICATION:` |
+| clock | `CLOCK_MAX_W = 400` | Date/time, right-aligned |
+
+The tag strip's width is measured at `Bar::create` time (and again
+on any `reload_config`) by running each padded tag name through a
+throwaway Pango layout against the active font and summing the
+pixel widths. `TAGS_EDGE_PAD = 20` provides a mirrored pad on each
+end of the strip; the prompt rect abuts the trailing pad so the
+`> ` prefix always lands exactly one edge-pad past the last tag's
+right edge, regardless of tag-name length or font choice.
+
+State mutations call `bar.mark_tags_dirty()`, `mark_prompt_dirty()`,
+`mark_title_dirty()`, `mark_clock_dirty()`, or `mark_all_dirty()` —
+none render directly. `wm.commit_bar()` runs once per event-loop
+iteration (in `main.rs::run`), consumes the dirty flags, renders
+only the dirty regions into the persistent surface, and
+`put_image`s each dirty rect to X. Fast path: no flags set →
+`commit` returns immediately.
+
+`mark_clock_dirty` caches the previous `format_clock()` output
+(`Bar.last_clock_text`). If the formatted string is unchanged, it
+is a no-op — a 1 Hz timer tick that lands inside the same
+wall-clock second produces zero work and zero compositor damage.
+
+The net effect: the 1 Hz clock tick pushes only the clock rect to
+X (a ~400×40 px region, ~64 KB) instead of the full panel
+(~400 KB). Title/notification/prompt updates similarly ship only
+their region's pixels. On NVIDIA X11 with
+`ForceFullCompositionPipeline = On`, the compositor's per-event
+recomposition cost scales with damage rect size, so shrinking the
+damage rect directly reduces GPU load.
+
 ## Hot-reload
 
 inotify watches the config file on `IN_CLOSE_WRITE`. On change,
@@ -283,11 +325,17 @@ src/
   event.rs          X11 event dispatcher
   keys.rs           Keysym resolution, grabs, action dispatch
   ewmh.rs           EWMH property setters
-  bar.rs            Multi-monitor status bar rendering
+  bar.rs            Multi-monitor status bar. Persistent per-panel
+                    Cairo surface, per-region dirty flags (tags/prompt
+                    /title/clock), push-driven commit that put_images
+                    only dirty rects (see "Bar redraw" section below).
   layout.rs         floating / tile / monocle
   mouse.rs          Super+drag move/resize, _NET_WM_MOVERESIZE
   mru.rs            Cyclical MRU ring
-  spawn.rs          posix_spawn with metachar detection
+  spawn.rs          posix_spawn with metachar detection; live-child
+                    registry + SIGTERM-on-quit (quit_children); resets
+                    child signal mask via POSIX_SPAWN_SETSIGMASK so
+                    children don't inherit demiurge's blocked signals
   monitor.rs        RandR monitor query
   torrentius.rs     Cairo/Pango primitives shared by demiurge + gordian_knot
 

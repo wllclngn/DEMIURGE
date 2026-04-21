@@ -29,10 +29,14 @@ pub fn handle(wm: &mut Wm, event: Event) {
         }
         Event::PropertyNotify(ev) => on_property_notify(wm, ev),
         Event::Expose(ev) => {
-            if let Some(ref bar) = wm.bar {
-                if bar.contains_window(ev.window) && ev.count == 0 {
-                    wm.redraw_bar();
-                }
+            if let Some(ref mut bar) = wm.bar
+                && bar.contains_window(ev.window)
+                && ev.count == 0
+            {
+                // Bar window was exposed; full repaint into the
+                // affected panel. Per-rect Expose handling is a
+                // post-v0.4.1 nice-to-have.
+                bar.mark_all_dirty();
             }
         }
         _ => {}
@@ -148,7 +152,12 @@ fn on_key_press(wm: &mut Wm, ev: KeyPressEvent) {
                 }
             }
         }
-        wm.redraw_bar();
+        // Prompt input changed, or prompt just closed; repaint the
+        // prompt region (commit happens at the end of this poll
+        // iteration in main.rs::run).
+        if let Some(ref mut bar) = wm.bar {
+            bar.mark_prompt_dirty();
+        }
         return;
     }
 
@@ -174,8 +183,10 @@ fn on_property_notify(wm: &mut Wm, ev: PropertyNotifyEvent) {
     if let Some(client) = wm.clients.iter_mut().find(|c| c.window == ev.window) {
         client.title = new_title;
     }
-    if Some(ev.window) == wm.focus {
-        wm.redraw_bar();
+    if Some(ev.window) == wm.focus
+        && let Some(ref mut bar) = wm.bar
+    {
+        bar.mark_title_dirty();
     }
 }
 

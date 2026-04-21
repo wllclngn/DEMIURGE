@@ -181,7 +181,9 @@ fn setup_signalfd() -> i32 {
 
 // Drain all finished children without blocking. Prevents spawned apps (kitty,
 // chromium, electron helpers that exit on failure) from accumulating as
-// zombies in the service cgroup.
+// zombies in the service cgroup. Also drops each reaped pid from the
+// live-child registry so quit_children doesn't later signal a pid that
+// has since been recycled by the kernel.
 fn reap_children() {
     unsafe {
         loop {
@@ -189,6 +191,7 @@ fn reap_children() {
             if pid <= 0 {
                 break;
             }
+            spawn::forget(pid);
         }
     }
 }
@@ -301,6 +304,13 @@ fn run(
             }
         }
 
+        // Push any pending bar dirty regions to X. This is the single
+        // commit point per event-loop iteration -- state mutations
+        // earlier in this iteration just set dirty flags; the actual
+        // render + put_image happens here. Fast path: if nothing is
+        // dirty, commit_bar returns immediately.
+        wm.commit_bar();
+
         let _ = wm.conn.flush();
 
         for fd in &mut fds {
@@ -347,13 +357,18 @@ fn run(
             }
         }
 
-        // Timer tick: redraw bar for clock update
+        // Timer tick: only the clock region needs to update. The
+        // actual render + put_image happens at the top of the next
+        // iteration in commit_bar(). mark_clock_dirty additionally
+        // gates on text-changed so a same-second tick is a no-op.
         if fds[2].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 8];
             unsafe {
                 libc::read(timer_fd, buf.as_mut_ptr() as *mut libc::c_void, 8);
             }
-            wm.redraw_bar();
+            if let Some(ref mut bar) = wm.bar {
+                bar.mark_clock_dirty();
+            }
         }
 
         // Config file changed: hot-reload
@@ -378,6 +393,11 @@ fn run(
 }
 
 fn cleanup(wm: &wm::Wm, timer_fd: i32, inotify_fd: i32) {
+    // Tear down the session's children before dropping the X connection,
+    // so terminals, music players, and tag-pinned helpers (montauk) exit
+    // alongside the WM instead of being reparented to init.
+    spawn::quit_children();
+
     if let Some(ref bar) = wm.bar {
         bar.destroy_all(&wm.conn);
     }
