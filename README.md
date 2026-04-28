@@ -174,10 +174,10 @@ Actions:
 | `mru_prev` | — | Alt+`/Alt+Shift+Tab backward through the MRU ring, active tag only |
 | `mru_next_global` | — | Super+Tab forward across **all tags** (switches tag as needed) |
 | `mru_prev_global` | — | Super+Shift+Tab backward across all tags |
-| `view_tag` | `"1"` .. `"N"` | Switch to tag (1-indexed) |
-| `view_prev_tag` | — | Previous tag |
-| `view_next_tag` | — | Next tag |
-| `move_to_tag` | `"1"` .. `"N"` | Move focused window to tag |
+| `view_tag` | `"1"` .. `"N"` | Switch focused monitor to tag (1-indexed). On multi-monitor, swaps with another monitor if it was already showing that tag. |
+| `view_prev_tag` | — | Previous tag on focused monitor |
+| `view_next_tag` | — | Next tag on focused monitor |
+| `move_to_tag` | `"1"` .. `"N"` | Move focused window to tag (visibility follows: stays mapped iff some monitor is showing the destination) |
 | `toggle_above` | — | Toggle `_NET_WM_STATE_ABOVE` on focused |
 | `toggle_fullscreen` | — | Toggle `_NET_WM_STATE_FULLSCREEN` on focused |
 | `toggle_layout` | — | Cycle active tag's layout |
@@ -231,6 +231,39 @@ the candidate count. On modifier release, `finish_cycle` commits
 `focus_window` dedupes: any focus change removes the target from the
 ring and re-inserts at position 0. Destroyed windows are scrubbed
 from the ring via `on_unmanage`.
+
+## Multi-monitor
+
+Each RandR output gets its own independent active tag. `wm.active_tags`
+is a `Vec<usize>` parallel to `wm.monitors`; entry `i` is the tag
+visible on monitor `i`. `wm.focused_monitor` is the index of the
+monitor receiving the next user action — view_tag, new-window spawn,
+toggle_layout all route to it.
+
+A tag can be visible on at most one monitor at a time. If you
+`view_tag T` on monitor A while monitor B is already showing tag T,
+the views swap: B takes the tag A was on, A takes T. This is
+XMonad-style behavior; it's the only sensible answer that doesn't
+duplicate one tag's clients across two monitors.
+
+`focused_monitor` updates implicitly via click-to-focus (the clicked
+window's monitor becomes focused) and via bar tag clicks (the clicked
+panel's monitor becomes focused, then the requested tag is applied
+there).
+
+`arrange()` iterates monitors and tiles each one's active tag's
+clients within that monitor's bar-reserved work area. Layouts stay
+keyed on tag (one `Layout` per tag, not per monitor-tag pair) — since
+a tag is on at most one monitor at a time, there's no ambiguity.
+
+`_NET_CURRENT_DESKTOP` reports the focused monitor's tag (the EWMH
+spec doesn't have a per-monitor slot). `_NET_WM_DESKTOP` on a client
+is its tag; the client is mapped iff some monitor is showing that tag.
+
+RandR hot-plug resizes `active_tags` in lockstep: shrink truncates
+and clamps `focused_monitor`; growth appends new entries picking
+unique tags so a freshly-plugged screen lands on a previously-hidden
+tag rather than mirroring an existing view.
 
 ## Notifications
 
@@ -414,10 +447,6 @@ suppresses auto-lock during video playback and fullscreen games.
 
 ## Known limitations
 
-- Multi-monitor layout: bar panels are per-RandR-output, but
-  fullscreen / tile / monocle layouts use `monitors[0]` only. Invisible
-  on single-monitor machines.
-- No RandR hot-plug. `monitor::query()` runs once at init.
 - No Alt+Tab overlay (functional cycling only, no thumbnail preview).
 - `_NET_WM_MOVERESIZE` edge-resize directions 0–7 are silently
   dropped. Affects Chromium-family edge drag.

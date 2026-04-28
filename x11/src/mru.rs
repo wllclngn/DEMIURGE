@@ -1,80 +1,61 @@
+// X11 MRU cycle wiring. The MruRing data structure and CycleState
+// pure-data live in demiurge_core::mru and are re-exported here.
+// What stays X11-specific: keyboard grab/ungrab, the cross-tag focus
+// hop (which goes through wm.view_tag_no_focus), and the modifier-
+// release detection via X11 KeyReleaseEvent.
+
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 
 use crate::wm::Wm;
 
-// Cyclical MRU ring. `wm.mru` holds all focusable windows in most-recently-
-// used order, with mru[0] = current focus. Each window appears exactly once.
-//
-// Cycling: while `wm.mru_cycle` is Some, the keyboard is grabbed and
-// `index` points at the currently-raised cycle target within `candidates`.
-// The ring is NOT reordered during cycling; the selection is committed on
-// modifier release by moving candidates[index] to the front of wm.mru via
-// the normal on_focus path.
-//
-// Two scopes:
-//   CycleScope::Tag  -- candidates restricted to the active tag. Drives
-//                       Alt+Tab / Alt+` (per-tag window cycling).
-//   CycleScope::All  -- candidates = full mru ring. Drives Super+Tab
-//                       (cross-tag cycling; tag switch happens as needed).
-#[derive(Debug, Clone, Copy)]
-pub enum CycleScope {
-    Tag,
-    All,
-}
+pub use demiurge_core::mru::{CycleScope, CycleState, MruRing};
 
-#[derive(Debug)]
-pub struct CycleState {
-    pub candidates: Vec<Window>,
-    pub index: usize,
-}
+// Type alias: wm.mru / wm.mru_cycle store ring + state typed against
+// x11rb's Window. Wayland's mru module will alias against its own
+// surface-id type while reusing the same generic core impl.
+pub type WindowRing = MruRing<Window>;
+pub type WindowCycle = CycleState<Window>;
 
-// Promote a window to the front of the ring. Existing occurrences are
-// removed so each window appears exactly once.
+// Promote a window to the front of the ring. Thin pass-through to
+// the core ring so existing call sites (`mru::on_focus(self, w)`)
+// keep compiling without touching wm.rs.
 pub fn on_focus(wm: &mut Wm, window: Window) {
-    wm.mru.retain(|&w| w != window);
-    wm.mru.insert(0, window);
+    wm.mru.on_focus(window);
 }
 
-// Window destroyed: remove from ring.
 pub fn on_unmanage(wm: &mut Wm, gone: Window) {
-    wm.mru.retain(|&w| w != gone);
+    wm.mru.on_unmanage(gone);
 }
 
 // Cycle press. `forward` advances toward older windows; backward walks
 // toward newer. Wraps both ways. `scope` chooses Tag-only or all windows.
 pub fn start_or_advance(wm: &mut Wm, forward: bool, scope: CycleScope) {
     let (candidates, index) = match wm.mru_cycle.take() {
-        Some(cur) => {
-            // Continuing an active cycle: advance the index against the
-            // candidate list we froze on first press. This keeps cycling
-            // stable even if the ring were mutated mid-cycle.
-            let len = cur.candidates.len();
-            if len < 2 {
+        Some(mut cur) => {
+            if cur.candidates.len() < 2 {
                 wm.mru_cycle = Some(cur);
                 return;
             }
-            let next_index = if forward {
-                (cur.index + 1) % len
-            } else {
-                (cur.index + len - 1) % len
-            };
-            (cur.candidates, next_index)
+            cur.advance(forward);
+            (cur.candidates, cur.index)
         }
         None => {
             // First press: compute candidates under the requested scope.
             let candidates: Vec<Window> = match scope {
-                CycleScope::All => wm.mru.clone(),
-                CycleScope::Tag => wm
-                    .mru
-                    .iter()
-                    .copied()
-                    .filter(|&w| {
-                        wm.clients
-                            .iter()
-                            .any(|c| c.window == w && c.tag == wm.active_tag)
-                    })
-                    .collect(),
+                CycleScope::All => wm.mru.as_slice().to_vec(),
+                CycleScope::Tag => {
+                    let active = wm.active_tag();
+                    wm.mru
+                        .iter()
+                        .copied()
+                        .filter(|&w| {
+                            wm.clients
+                                .iter()
+                                .any(|c| c.window == w && c.tag == active)
+                        })
+                        .collect()
+                }
             };
             if candidates.len() < 2 {
                 return;
@@ -112,8 +93,11 @@ pub fn start_or_advance(wm: &mut Wm, forward: bool, scope: CycleScope) {
 // its on_focus promotion because mru_cycle is Some.
 fn focus_target(wm: &mut Wm, target: Window) {
     let target_tag = wm.clients.iter().find(|c| c.window == target).map(|c| c.tag);
+    // If the target lives on a tag that no monitor is currently showing,
+    // bring it onto the focused monitor (view_tag_no_focus handles the
+    // swap-on-collision and visibility transitions).
     if let Some(t) = target_tag
-        && t != wm.active_tag
+        && !wm.tag_visible(t)
     {
         wm.view_tag_no_focus(t);
     }
@@ -125,8 +109,8 @@ pub fn finish_cycle(wm: &mut Wm) {
     let _ = wm.conn.flush();
     // Commit: promote the cycle target to the front of the ring.
     if let Some(cycle) = wm.mru_cycle.take() {
-        if let Some(&target) = cycle.candidates.get(cycle.index) {
-            on_focus(wm, target);
+        if let Some(target) = cycle.current() {
+            wm.mru.on_focus(target);
         }
     }
 }

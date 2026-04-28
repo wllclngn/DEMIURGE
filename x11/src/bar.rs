@@ -172,6 +172,109 @@ pub struct PromptState {
     pub completion: Option<String>,
 }
 
+// Allocate one BarPanel per monitor: create the override-redirect dock
+// window, set _NET_WM_WINDOW_TYPE_DOCK + _NET_WM_STRUT_PARTIAL, allocate
+// the persistent Cairo surface, build the region rect partition. Used by
+// both Bar::create (initial setup) and Bar::rebuild_panels (post-RandR).
+fn build_panels(
+    conn: &RustConnection,
+    root: Window,
+    atoms: &Atoms,
+    depth: u8,
+    height: u32,
+    bg_pixel: u32,
+    tags_w: i32,
+    monitors: &[Monitor],
+) -> Result<Vec<BarPanel>, String> {
+    let mut panels = Vec::with_capacity(monitors.len());
+
+    for (i, mon) in monitors.iter().enumerate() {
+        let window = conn.generate_id().map_err(|e| format!("bar window id: {}", e))?;
+        let gc = conn.generate_id().map_err(|e| format!("bar gc id: {}", e))?;
+
+        conn.create_window(
+            depth,
+            window,
+            root,
+            mon.x as i16,
+            mon.y as i16,
+            mon.width as u16,
+            height as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(bg_pixel)
+                .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
+        )
+        .map_err(|e| format!("create bar window: {}", e))?;
+
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms._NET_WM_WINDOW_TYPE,
+            AtomEnum::ATOM,
+            &[atoms._NET_WM_WINDOW_TYPE_DOCK],
+        );
+
+        let strut: [u32; 12] = [
+            0,
+            0,
+            height,
+            0,
+            0,
+            0,
+            0,
+            0,
+            mon.x as u32,
+            mon.x as u32 + mon.width - 1,
+            0,
+            0,
+        ];
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms._NET_WM_STRUT_PARTIAL,
+            AtomEnum::CARDINAL,
+            &strut,
+        );
+
+        conn.create_gc(gc, window, &CreateGCAux::new())
+            .map_err(|e| format!("create bar gc: {}", e))?;
+
+        let _ = conn.map_window(window);
+        let _ = conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        );
+
+        let surface = cairo::ImageSurface::create(
+            cairo::Format::Rgb24,
+            mon.width as i32,
+            height as i32,
+        )
+        .map_err(|e| format!("bar surface {}x{}: {}", mon.width, height, e))?;
+
+        let rects = region_rects(mon.width as i32, height as i32, tags_w);
+
+        panels.push(BarPanel {
+            window,
+            gc,
+            width: mon.width,
+            surface,
+            rects,
+        });
+
+        eprintln!(
+            "[demiurge] bar {}: {}x{} on '{}'",
+            i, mon.width, height, mon.name,
+        );
+    }
+
+    Ok(panels)
+}
+
 impl Bar {
     pub fn create(
         conn: &RustConnection,
@@ -192,91 +295,7 @@ impl Bar {
         let font_options = crate::torrentius::make_font_options()?;
         let tags_w = measure_tags_total_w(&font_desc, &font_options, tag_names);
 
-        let mut panels = Vec::new();
-
-        for (i, mon) in monitors.iter().enumerate() {
-            let window = conn.generate_id().map_err(|e| format!("bar window id: {}", e))?;
-            let gc = conn.generate_id().map_err(|e| format!("bar gc id: {}", e))?;
-
-            conn.create_window(
-                depth,
-                window,
-                root,
-                mon.x as i16,
-                mon.y as i16,
-                mon.width as u16,
-                height as u16,
-                0,
-                WindowClass::INPUT_OUTPUT,
-                0,
-                &CreateWindowAux::new()
-                    .override_redirect(1)
-                    .background_pixel(bg_pixel)
-                    .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
-            )
-            .map_err(|e| format!("create bar window: {}", e))?;
-
-            let _ = conn.change_property32(
-                PropMode::REPLACE,
-                window,
-                atoms._NET_WM_WINDOW_TYPE,
-                AtomEnum::ATOM,
-                &[atoms._NET_WM_WINDOW_TYPE_DOCK],
-            );
-
-            let strut: [u32; 12] = [
-                0,
-                0,
-                height,
-                0,
-                0,
-                0,
-                0,
-                0,
-                mon.x as u32,
-                mon.x as u32 + mon.width - 1,
-                0,
-                0,
-            ];
-            let _ = conn.change_property32(
-                PropMode::REPLACE,
-                window,
-                atoms._NET_WM_STRUT_PARTIAL,
-                AtomEnum::CARDINAL,
-                &strut,
-            );
-
-            conn.create_gc(gc, window, &CreateGCAux::new())
-                .map_err(|e| format!("create bar gc: {}", e))?;
-
-            let _ = conn.map_window(window);
-            let _ = conn.configure_window(
-                window,
-                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-            );
-
-            let surface = cairo::ImageSurface::create(
-                cairo::Format::Rgb24,
-                mon.width as i32,
-                height as i32,
-            )
-            .map_err(|e| format!("bar surface {}x{}: {}", mon.width, height, e))?;
-
-            let rects = region_rects(mon.width as i32, height as i32, tags_w);
-
-            panels.push(BarPanel {
-                window,
-                gc,
-                width: mon.width,
-                surface,
-                rects,
-            });
-
-            eprintln!(
-                "[demiurge] bar {}: {}x{} on '{}'",
-                i, mon.width, height, mon.name,
-            );
-        }
+        let panels = build_panels(conn, root, atoms, depth, height, bg_pixel, tags_w, monitors)?;
 
         let _ = conn.flush();
 
@@ -323,6 +342,15 @@ impl Bar {
         self.panels.iter().any(|p| p.window == window)
     }
 
+    // Index of the panel whose X window matches. Used by the bar
+    // tag-click router so the click resolves to the monitor that owns
+    // the clicked panel (and therefore the monitor whose active tag
+    // should be changed). Panels are stored parallel to monitors --
+    // panels[i] corresponds to monitors[i].
+    pub fn panel_index(&self, window: Window) -> Option<usize> {
+        self.panels.iter().position(|p| p.window == window)
+    }
+
     pub fn raise_all(&self, conn: &RustConnection) {
         for panel in &self.panels {
             let _ = conn.configure_window(
@@ -336,6 +364,49 @@ impl Bar {
         for panel in &self.panels {
             let _ = conn.destroy_window(panel.window);
         }
+    }
+
+    // Tear down every existing panel window and rebuild against a new
+    // monitor list. Called by Wm::refresh_monitors after RandR reports
+    // a layout change; handles count change (hot-plug) as well as size
+    // change (xrandr -s). Caller is responsible for marking the bar
+    // dirty so the new panels paint at the next commit.
+    pub fn rebuild_panels(
+        &mut self,
+        conn: &RustConnection,
+        root: Window,
+        atoms: &Atoms,
+        monitors: &[Monitor],
+    ) -> Result<(), String> {
+        for panel in &self.panels {
+            let _ = conn.destroy_window(panel.window);
+        }
+        self.panels.clear();
+
+        // Reconstruct the background pixel from the cached f64 RGB. The
+        // value originally came from torrentius::hex_to_pixel(config.bar.bg);
+        // we don't store the hex string so derive it from the color tuple
+        // we already keep for Cairo rendering. RGB24 pack: 0x00RRGGBB.
+        let (r, g, b) = self.colors.bg;
+        let bg_pixel = (((r * 255.0) as u32) << 16)
+            | (((g * 255.0) as u32) << 8)
+            | ((b * 255.0) as u32);
+
+        let tags_w = measure_tags_total_w(&self.font_desc, &self.font_options, &self.tag_names);
+
+        self.panels = build_panels(
+            conn,
+            root,
+            atoms,
+            self.depth,
+            self.height,
+            bg_pixel,
+            tags_w,
+            monitors,
+        )?;
+
+        let _ = conn.flush();
+        Ok(())
     }
 
     // Mark helpers: state mutations call these; nothing renders yet.
@@ -370,10 +441,15 @@ impl Bar {
     // Called once per event-loop iteration. Fast path: nothing dirty ->
     // return immediately. Otherwise render each dirty region into its
     // panel's persistent surface and put_image just that rect.
+    //
+    // active_tags: per-panel active tag (parallel to self.panels). Each
+    // panel renders ITS monitor's active tag highlighted. This is what
+    // makes per-monitor tag views legible at a glance: monitor 0's bar
+    // highlights its tag, monitor 1's bar highlights its tag.
     pub fn commit(
         &mut self,
         conn: &RustConnection,
-        active_tag: usize,
+        active_tags: &[usize],
         occupied: &[bool],
         center_text: &str,
         is_notification: bool,
@@ -404,6 +480,13 @@ impl Bar {
             let want_prompt = dirty.all || dirty.prompt;
             let want_title = dirty.all || dirty.title;
             let want_clock = dirty.all || dirty.clock;
+
+            // Defensive: if active_tags is shorter than panels (e.g. a
+            // RandR refresh raced this commit), fall back to panel 0's
+            // tag rather than panicking out of the WM.
+            let active_tag = active_tags.get(pi).copied().unwrap_or_else(
+                || active_tags.first().copied().unwrap_or(0),
+            );
 
             if want_tags {
                 self.render_tags(pi, active_tag, occupied);

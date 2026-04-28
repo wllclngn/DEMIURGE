@@ -18,8 +18,8 @@
 
 use std::fs;
 
-use demiurge::config;
-use demiurge::gordian_knot::sysinfo;
+use demiurge_x11::config;
+use demiurge_x11::gordian_knot::sysinfo;
 
 fn parse_config(content: &str) -> config::Config {
     let dir = tempfile::tempdir().unwrap();

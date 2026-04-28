@@ -304,6 +304,13 @@ fn run(
             }
         }
 
+        // RandR drain: any RandrScreenChangeNotify / RandrNotify in this
+        // iteration's batch has flipped wm.monitors_dirty. Refresh once,
+        // before commit_bar, so the bar repaints with the new geometry.
+        if wm.monitors_dirty {
+            wm.refresh_monitors();
+        }
+
         // Push any pending bar dirty regions to X. This is the single
         // commit point per event-loop iteration -- state mutations
         // earlier in this iteration just set dirty flags; the actual

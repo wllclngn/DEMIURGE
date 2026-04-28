@@ -19,8 +19,8 @@
 use std::env;
 use std::process::ExitCode;
 
-use demiurge::config;
-use demiurge::gordian_knot::{daemon, landlock, privsep, seccomp, vt, x11_lock};
+use demiurge_x11::config;
+use demiurge_x11::gordian_knot::{daemon, landlock, privsep, seccomp, vt, x11_lock};
 
 enum Mode {
     Auto,

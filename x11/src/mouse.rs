@@ -88,9 +88,14 @@ pub fn start_drag(wm: &mut Wm, window: Window, ev: &ButtonPressEvent) {
     // Focus the window
     wm.focus_window(Some(window));
 
-    // If in tiled layout, float this window out of the layout
-    let tag = wm.active_tag;
-    if wm.layouts[tag] != Layout::Floating {
+    // If the window's tag is on a non-floating layout, pop it out so
+    // the drag is actually meaningful (otherwise the next arrange()
+    // would snap it back). We key off the window's own tag, not any
+    // global active tag -- correct under per-monitor active tags too.
+    let tag = wm.clients.iter().find(|c| c.window == window).map(|c| c.tag);
+    if let Some(t) = tag
+        && wm.layouts[t] != Layout::Floating
+    {
         if let Some(client) = wm.clients.iter_mut().find(|c| c.window == window) {
             if !client.floating {
                 client.floating = true;
@@ -189,8 +194,12 @@ pub fn start_csd_move(wm: &mut Wm, window: Window, root_x: i16, root_y: i16) {
 
     wm.focus_window(Some(window));
 
-    let tag = wm.active_tag;
-    if wm.layouts[tag] != Layout::Floating {
+    // Same per-monitor reasoning as start_drag: float out using the
+    // window's own tag, not any global active tag.
+    let tag = wm.clients.iter().find(|c| c.window == window).map(|c| c.tag);
+    if let Some(t) = tag
+        && wm.layouts[t] != Layout::Floating
+    {
         if let Some(client) = wm.clients.iter_mut().find(|c| c.window == window) {
             if !client.floating {
                 client.floating = true;

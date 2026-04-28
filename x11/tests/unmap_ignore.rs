@@ -5,7 +5,7 @@
 // We can't unit-test the event handler itself without an X connection, so
 // we verify the invariants of the counter that the handler relies on.
 
-use demiurge::wm::Client;
+use demiurge_x11::wm::Client;
 
 fn fresh_client() -> Client {
     Client {

@@ -9,8 +9,8 @@ fn parse_config(content: &str) -> Result<(), String> {
     let path = dir.path().join("config.toml");
     fs::write(&path, content).unwrap();
 
-    let paths = demiurge::config::Paths::with_config(path);
-    demiurge::config::load(&paths).map(|_| ())
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    demiurge_x11::config::load(&paths).map(|_| ())
 }
 
 #[test]
@@ -74,8 +74,8 @@ tags = ["A"]
     let path = dir.path().join("config.toml");
     fs::write(&path, toml).unwrap();
 
-    let paths = demiurge::config::Paths::with_config(path);
-    let cfg = demiurge::config::load(&paths).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
 
     assert_eq!(cfg.general.default_layout, "floating");
     assert_eq!(cfg.bar.height, 30);
@@ -202,8 +202,8 @@ tags = ["1", "2"]
 
 #[test]
 fn missing_config_file_uses_defaults() {
-    let paths = demiurge::config::Paths::with_config(PathBuf::from("/nonexistent/config.toml"));
-    let cfg = demiurge::config::load(&paths).expect("missing config should fall back to defaults");
+    let paths = demiurge_x11::config::Paths::with_config(PathBuf::from("/nonexistent/config.toml"));
+    let cfg = demiurge_x11::config::load(&paths).expect("missing config should fall back to defaults");
     assert_eq!(cfg.general.tags, vec!["X", "Y", "Z"]);
     assert_eq!(cfg.general.default_layout, "floating");
     assert!(cfg.keybinds.is_empty());
@@ -219,8 +219,8 @@ tags = ["1"]
     let path = dir.path().join("config.toml");
     fs::write(&path, toml).unwrap();
 
-    let paths = demiurge::config::Paths::with_config(path);
-    let cfg = demiurge::config::load(&paths).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
     assert!((cfg.general.master_ratio - 0.5).abs() < f64::EPSILON);
 }
 
@@ -235,8 +235,8 @@ master_ratio = 0.65
     let path = dir.path().join("config.toml");
     fs::write(&path, toml).unwrap();
 
-    let paths = demiurge::config::Paths::with_config(path);
-    let cfg = demiurge::config::load(&paths).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
     assert!((cfg.general.master_ratio - 0.65).abs() < f64::EPSILON);
 }
 
@@ -307,8 +307,8 @@ class = "montauk-term"
     let path = dir.path().join("config.toml");
     fs::write(&path, toml).unwrap();
 
-    let paths = demiurge::config::Paths::with_config(path);
-    let cfg = demiurge::config::load(&paths).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
 
     assert_eq!(cfg.startup.spawn.len(), 2);
     assert_eq!(cfg.startup.spawn[0].cmd, "kitty");

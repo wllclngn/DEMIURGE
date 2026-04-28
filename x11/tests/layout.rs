@@ -1,4 +1,4 @@
-use demiurge::layout::Layout;
+use demiurge_x11::layout::Layout;
 
 #[test]
 fn layout_next_cycles() {

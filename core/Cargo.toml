@@ -1,0 +1,18 @@
+[package]
+name = "demiurge-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "demiurge_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Cairo/Pango primitives are 2D-rendering-server-agnostic. Both x11
+# (cairo into XImage) and wayland (cairo into a wl_shm buffer or GL
+# texture upload) consume them.
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+pango = "0.20"

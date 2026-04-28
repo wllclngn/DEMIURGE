@@ -1,41 +1,13 @@
+// Action enum lives in demiurge-core (server-agnostic verb set). The
+// keycode-based compilation and X11 grab_key wiring below is
+// X11-specific and stays here.
+
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
 use crate::config::Keybind;
-
-// Actions the WM can perform
-#[derive(Debug, Clone)]
-pub enum Action {
-    Spawn(String),
-    CloseWindow,
-    Quit,
-    MruNext,
-    MruPrev,
-    MruNextGlobal,
-    MruPrevGlobal,
-    ViewTag(usize),
-    ViewPrevTag,
-    ViewNextTag,
-    MoveToTag(usize),
-    ToggleAbove,
-    ToggleFullscreen,
-    ToggleLayout,
-    RunPrompt,
-    Screenshot,
-    Lock,
-    // System controls. Each one shells out to its CLI (wpctl, xbacklight,
-    // playerctl), reads the new state, and fires a bar notification.
-    VolumeUp,
-    VolumeDown,
-    VolumeMute,
-    VolumeMicMute,
-    BrightnessUp,
-    BrightnessDown,
-    MediaPlayPause,
-    MediaNext,
-    MediaPrev,
-}
+pub use demiurge_core::Action;
 
 // A resolved keybinding: keycode + modifier mask -> action
 #[derive(Debug)]

@@ -1,4 +1,4 @@
-use demiurge::bar::{find_completion, parse_hex, scan_path};
+use demiurge_x11::bar::{find_completion, parse_hex, scan_path};
 
 // parse_hex tests
 

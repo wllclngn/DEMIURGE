@@ -1,0 +1,31 @@
+[package]
+name = "demiurge-wl"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "demiurge_wl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demiurge-wl"
+path = "src/main.rs"
+
+[dependencies]
+demiurge-core = { path = "../core" }
+# Smithay scaffolding. default-features = false avoids pulling in the
+# DRM/udev/libinput/x11/vulkan stack we don't need yet; we'll add
+# backend_udev when the real-session sprint lands.
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+] }
+# Match smithay's transitive pins so the workspace resolves to a single
+# version of each.
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server"] }
+calloop = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

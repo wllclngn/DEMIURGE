@@ -1,31 +1,10 @@
-[package]
-name = "demiurge"
-version = "0.5.0"
+[workspace]
+resolver = "2"
+members = ["core", "x11", "wayland"]
+
+[workspace.package]
+version = "0.6.0"
 edition = "2024"
-
-[[bin]]
-name = "demiurge"
-path = "src/main.rs"
-
-[[bin]]
-name = "gordian_knot"
-path = "src/bin/gordian_knot.rs"
-
-[dependencies]
-x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver"] }
-cairo-rs = { version = "0.20", features = ["png"] }
-pangocairo = "0.20"
-pango = "0.20"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-libc = "0.2"
-# D-Bus client for gordian_knot's inhibit-watcher (logind ListInhibitors).
-# zbus 4 with default async-io runtime (smol-based, tiny); we use its
-# blocking re-exports since gordian_knot's D-Bus calls are infrequent.
-zbus = "4"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 opt-level = "z"

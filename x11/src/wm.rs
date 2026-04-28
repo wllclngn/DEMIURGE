@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::ewmh;
 use crate::keys::{self, Action, Binding};
 use crate::layout::Layout;
-use crate::monitor::{self, Monitor};
+use crate::monitor::{self, Monitor, Monitors};
 use crate::mouse::DragState;
 use crate::mru;
 use crate::spawn;
@@ -59,10 +59,22 @@ pub struct Wm {
     pub conn: RustConnection,
     pub root: Window,
     pub atoms: Atoms,
-    pub monitors: Vec<Monitor>,
+    pub monitors: Monitors,
     pub clients: Vec<Client>,
     pub focus: Option<Window>,
-    pub active_tag: usize,
+    // Per-monitor active tag. Indexed parallel to self.monitors -- entry i
+    // is the tag currently visible on monitors[i]. Length is always
+    // monitors.len(); resized in refresh_monitors when RandR reports a
+    // count change. The "current desktop" reported via EWMH is whichever
+    // entry corresponds to focused_monitor.
+    pub active_tags: Vec<usize>,
+    // Index into self.monitors. The monitor that owns the next user
+    // action: view_tag changes its active tag, new windows land on its
+    // active tag, _NET_CURRENT_DESKTOP reports its tag. Updated on
+    // click-to-focus (focus_window picks up the focused window's
+    // monitor) and on bar tag clicks (the clicked panel's monitor
+    // becomes focused).
+    pub focused_monitor: usize,
     pub num_tags: usize,
     pub bindings: Vec<Binding>,
     pub bar_height: u32,
@@ -74,13 +86,17 @@ pub struct Wm {
     // Most-recently-used ring. mru[0] is the current focus; each window
     // appears exactly once. Alt+Tab cycles an index into this ring without
     // reordering it; the selection is committed on Alt release.
-    pub mru: Vec<Window>,
-    pub mru_cycle: Option<mru::CycleState>,
+    pub mru: mru::WindowRing,
+    pub mru_cycle: Option<mru::WindowCycle>,
     pub pending_spawns: Vec<PendingSpawn>,
     pub notification: Option<Notification>,
     pub alt_keycodes: Vec<Keycode>,
     pub keymap: keys::KeyMap,
     pub bar: Option<Bar>,
+    // Set by RandR notify handlers; consumed once per event-loop iteration.
+    // Coalesces the burst of CRTC/Output/ScreenChange events that xrandr
+    // emits into a single refresh.
+    pub monitors_dirty: bool,
 }
 
 impl Wm {
@@ -119,6 +135,13 @@ impl Wm {
                 "[demiurge] monitor {}: '{}' {}x{}+{}+{}",
                 i, mon.name, mon.width, mon.height, mon.x, mon.y
             );
+        }
+
+        // Subscribe to RandR change notifies. Without this, xrandr -s,
+        // hot-plug, and per-output mode swaps go unnoticed and the bar /
+        // workarea / tile geometry stay frozen at startup values.
+        if let Err(e) = monitor::select_input(&conn, root) {
+            eprintln!("[demiurge] randr select_input failed: {} (display tracking disabled)", e);
         }
 
         let num_tags = config.general.tags.len();
@@ -165,6 +188,17 @@ impl Wm {
             .reply()
             .map_err(|e| format!("query_tree reply: {}", e))?;
 
+        // Initial active_tags: one entry per monitor. monitors.len() >= 1
+        // by Monitors's type-level invariant. Each monitor starts on a
+        // distinct tag if possible (monitor 0 -> tag 0, monitor 1 -> tag
+        // 1, ...) so a fresh dual-head session shows two empty tags
+        // rather than two views of the same one; extras wrap to the
+        // last tag.
+        let active_tags: Vec<usize> = {
+            let last = num_tags.saturating_sub(1);
+            (0..monitors.len()).map(|i| i.min(last)).collect()
+        };
+
         let mut wm = Self {
             conn,
             root,
@@ -172,7 +206,8 @@ impl Wm {
             monitors,
             clients: Vec::new(),
             focus: None,
-            active_tag: 0,
+            active_tags,
+            focused_monitor: 0,
             num_tags,
             bindings,
             bar_height,
@@ -181,13 +216,14 @@ impl Wm {
             layouts,
             master_ratio,
             drag: None,
-            mru: Vec::new(),
+            mru: mru::WindowRing::new(),
             mru_cycle: None,
             pending_spawns: Vec::new(),
             notification: None,
             alt_keycodes,
             keymap,
             bar: Some(bar),
+            monitors_dirty: false,
         };
 
         // Manage pre-existing windows
@@ -261,7 +297,7 @@ impl Wm {
             .position(|p| p.class_match == class)
         {
             Some(idx) => self.pending_spawns.remove(idx).target_tag,
-            None => self.active_tag,
+            None => self.active_tags[self.focused_monitor],
         };
 
         // Set frame extents (zeros -- no decorations)
@@ -339,16 +375,18 @@ impl Wm {
             );
         }
 
-        // Focus the new window only if it landed on the currently visible
-        // tag. Cross-tag spawns (tag-targeted startup) stay in the
-        // background until the user views that tag.
-        if target_tag == self.active_tag {
+        // Focus the new window only if its tag is currently visible on
+        // some monitor. Cross-tag spawns (tag-targeted startup) stay in
+        // the background until a monitor views that tag.
+        if self.tag_visible(target_tag) {
             self.focus_window(Some(window));
         }
 
-        if self.layouts[self.active_tag] != Layout::Floating {
-            self.arrange();
-        }
+        // Always re-arrange: target_tag's monitor (if visible) needs to
+        // retile to include the new window. arrange() is now per-monitor,
+        // so it's safe to call unconditionally; the monitor showing a
+        // floating-layout tag is a no-op for that monitor.
+        self.arrange();
 
         // Tag-occupied state may have flipped (first window on this tag).
         if let Some(ref mut bar) = self.bar {
@@ -368,15 +406,19 @@ impl Wm {
                 mru::finish_cycle(self);
             }
 
-            // If we lost focus, pick next window. on_unmanage scrubbed
-            // `window` from the MRU ring already, so pick_focus_for_tag
-            // naturally skips it; `exclude` is belt-and-suspenders.
+            // If we lost focus, pick next window on the focused monitor's
+            // active tag. on_unmanage scrubbed `window` from the MRU ring
+            // already, so pick_focus_for_tag naturally skips it; `exclude`
+            // is belt-and-suspenders.
             if self.focus == Some(window) {
-                let next = self.pick_focus_for_tag(self.active_tag, Some(window));
+                let next = self.pick_focus_for_tag(self.active_tag(), Some(window));
                 self.focus_window(next);
             }
 
-            if tag == self.active_tag && self.layouts[tag] != Layout::Floating {
+            // Re-tile if the closed window's tag is visible on any
+            // monitor; arrange iterates monitors so it's safe to call
+            // unconditionally for non-floating layouts.
+            if self.tag_visible(tag) && self.layouts[tag] != Layout::Floating {
                 self.arrange();
             }
 
@@ -397,6 +439,27 @@ impl Wm {
         if self.mru_cycle.is_none() {
             if let Some(target) = window {
                 mru::on_focus(self, target);
+            }
+        }
+
+        // If the new focus belongs to a different monitor, the user has
+        // implicitly switched focused_monitor. Update so subsequent
+        // view_tag / new-window-spawn / current-desktop reporting all
+        // route to the right monitor. Suppressed during MRU cycle (the
+        // ring is mid-step; commit happens in finish_cycle).
+        if self.mru_cycle.is_none()
+            && let Some(win) = window
+            && let Some(client) = self.clients.iter().find(|c| c.window == win)
+        {
+            let mi = self.client_monitor_index(client);
+            if mi != self.focused_monitor {
+                self.focused_monitor = mi;
+                ewmh::set_current_desktop(
+                    &self.conn,
+                    self.root,
+                    &self.atoms,
+                    self.active_tags[mi] as u32,
+                );
             }
         }
 
@@ -444,32 +507,71 @@ impl Wm {
 
     // TAGS
 
-    // Switch to a tag without picking a focus. Used by Alt+Tab cross-tag
-    // stepping where the cycle has already chosen a target window.
+    // Switch the focused monitor to `tag`. Used by Alt+Tab cross-tag
+    // stepping where the cycle has already chosen a target window
+    // (focus is set later).
+    //
+    // Multi-monitor semantics:
+    //   - If `tag` is already active on the focused monitor, no-op.
+    //   - If `tag` is active on another monitor B, swap: B takes the
+    //     tag the focused monitor was on, focused monitor takes `tag`.
+    //     This matches XMonad's behavior and avoids ever showing the
+    //     same tag on two monitors at once (which would mean two
+    //     simultaneous views of the same client list).
+    //   - Otherwise the focused monitor's tag is replaced wholesale;
+    //     whatever tag it was on is now hidden (no monitor shows it).
+    //
+    // Visibility is then recomputed: tags that lost their monitor get
+    // their clients unmapped, tags that gained one get mapped.
     pub fn view_tag_no_focus(&mut self, tag: usize) {
-        if tag >= self.num_tags || tag == self.active_tag {
+        if tag >= self.num_tags {
+            return;
+        }
+        let m = self.focused_monitor;
+        let old_tag = self.active_tags[m];
+        if old_tag == tag {
             return;
         }
 
-        self.active_tag = tag;
-        ewmh::set_current_desktop(&self.conn, self.root, &self.atoms, tag as u32);
+        // Snapshot pre-state so we can diff visibility.
+        let prev: Vec<usize> = self.active_tags.clone();
 
-        // Show/hide windows. Bump unmap_ignore before each self-unmap so
-        // the UnmapNotify echo doesn't unmanage the client.
+        // Apply the change with swap-on-collision.
+        if let Some(other) = self.monitor_for_tag(tag) {
+            // Swap: the other monitor takes our previous tag.
+            self.active_tags[other] = old_tag;
+        }
+        self.active_tags[m] = tag;
+
+        let now: Vec<usize> = self.active_tags.clone();
+        let was_visible = |t: usize| prev.contains(&t);
+        let is_visible = |t: usize| now.contains(&t);
+
+        // Map clients on tags that became visible; unmap clients on
+        // tags that became hidden. Bump unmap_ignore before each
+        // self-unmap so the UnmapNotify echo doesn't unmanage.
         for client in &mut self.clients {
-            if client.tag == tag {
+            let pre = was_visible(client.tag);
+            let post = is_visible(client.tag);
+            if !pre && post {
                 let _ = self.conn.map_window(client.window);
-            } else {
+            } else if pre && !post {
                 client.unmap_ignore = client.unmap_ignore.saturating_add(1);
                 let _ = self.conn.unmap_window(client.window);
             }
         }
 
-        if self.layouts[tag] != Layout::Floating {
-            self.arrange();
-        }
+        ewmh::set_current_desktop(&self.conn, self.root, &self.atoms, tag as u32);
 
-        // Active tag highlight changed; tag region needs a repaint.
+        // Re-tile: every monitor's view may have changed (we may have
+        // swapped). arrange() is per-monitor and a no-op for monitors
+        // whose tag is on a floating layout.
+        self.arrange();
+
+        // Active tag highlight changed on the focused monitor (and the
+        // swap target if any); tag region needs a repaint on the
+        // affected panels. mark_tags_dirty repaints all panels which is
+        // cheap enough.
         if let Some(ref mut bar) = self.bar {
             bar.mark_tags_dirty();
         }
@@ -477,11 +579,12 @@ impl Wm {
     }
 
     pub fn view_tag(&mut self, tag: usize) {
-        if tag >= self.num_tags || tag == self.active_tag {
+        if tag >= self.num_tags || self.active_tags[self.focused_monitor] == tag {
             return;
         }
         self.view_tag_no_focus(tag);
-        let next = self.pick_focus_for_tag(tag, None);
+        // Focus picks from the focused monitor's now-visible tag.
+        let next = self.pick_focus_for_tag(self.active_tags[self.focused_monitor], None);
         self.focus_window(next);
     }
 
@@ -516,16 +619,14 @@ impl Wm {
     }
 
     pub fn view_prev_tag(&mut self) {
-        let prev = if self.active_tag == 0 {
-            self.num_tags - 1
-        } else {
-            self.active_tag - 1
-        };
+        let cur = self.active_tags[self.focused_monitor];
+        let prev = if cur == 0 { self.num_tags - 1 } else { cur - 1 };
         self.view_tag(prev);
     }
 
     pub fn view_next_tag(&mut self) {
-        let next = (self.active_tag + 1) % self.num_tags;
+        let cur = self.active_tags[self.focused_monitor];
+        let next = (cur + 1) % self.num_tags;
         self.view_tag(next);
     }
 
@@ -533,22 +634,45 @@ impl Wm {
         if tag >= self.num_tags {
             return;
         }
-        if let Some(win) = self.focus {
-            if let Some(client) = self.clients.iter_mut().find(|c| c.window == win) {
-                client.tag = tag;
-                ewmh::set_client_desktop(&self.conn, win, &self.atoms, tag as u32);
-
-                if tag != self.active_tag {
-                    client.unmap_ignore = client.unmap_ignore.saturating_add(1);
-                    let _ = self.conn.unmap_window(win);
-                    // Focus next on current tag, excluding the window we
-                    // just moved off.
-                    let next = self.pick_focus_for_tag(self.active_tag, Some(win));
-                    self.focus_window(next);
-                }
-                let _ = self.conn.flush();
+        let win = match self.focus {
+            Some(w) => w,
+            None => return,
+        };
+        // Compute visibility before borrowing clients mutably; tag_visible
+        // reads self.active_tags which would conflict with iter_mut.
+        let dest_visible = self.tag_visible(tag);
+        let moved = if let Some(client) = self.clients.iter_mut().find(|c| c.window == win) {
+            if client.tag == tag {
+                return;
             }
+            client.tag = tag;
+            if !dest_visible {
+                client.unmap_ignore = client.unmap_ignore.saturating_add(1);
+            }
+            true
+        } else {
+            false
+        };
+        if !moved {
+            return;
         }
+
+        ewmh::set_client_desktop(&self.conn, win, &self.atoms, tag as u32);
+
+        if !dest_visible {
+            let _ = self.conn.unmap_window(win);
+            // Focus pick: the focused monitor's tag (which is the tag
+            // we just walked off if the user was on the focused
+            // monitor's view). pick_focus_for_tag excludes `win`.
+            let next = self.pick_focus_for_tag(self.active_tag(), Some(win));
+            self.focus_window(next);
+        } else {
+            // Window stays mapped (destination tag is showing on some
+            // monitor). Re-arrange so it lands in the right monitor's
+            // work area.
+            self.arrange();
+        }
+        let _ = self.conn.flush();
     }
 
     // ACTIONS
@@ -1115,7 +1239,7 @@ impl Wm {
         if let Some(ref mut bar) = self.bar {
             bar.commit(
                 &self.conn,
-                self.active_tag,
+                &self.active_tags,
                 &occupied,
                 &center_text,
                 is_notification,
@@ -1128,8 +1252,172 @@ impl Wm {
         self.clients.iter().any(|c| c.tag == tag)
     }
 
+    // RandR change handler. Drained once per event-loop iteration after
+    // any RandR notify has flipped self.monitors_dirty; coalesces the
+    // burst of CRTC/Output/ScreenChange events xrandr emits into a single
+    // re-arrange. No-op (with the flag cleared) if the new layout matches
+    // the cached one.
+    //
+    // On a real change:
+    //   1. EWMH _NET_WORKAREA / _NET_DESKTOP_GEOMETRY are re-emitted so
+    //      EWMH-aware clients (Chromium, et al.) maximize to the right rect.
+    //   2. Bar panels are torn down and recreated against the new monitor
+    //      list (handles hot-plug count change as well as resolution).
+    //   3. arrange() retiles the active tag against the new work area.
+    //   4. Bar is marked all-dirty for a full repaint at next commit.
+    pub fn refresh_monitors(&mut self) {
+        self.monitors_dirty = false;
+        let new_monitors = monitor::query(&self.conn, self.root);
+        if new_monitors == self.monitors {
+            return;
+        }
+        eprintln!(
+            "[{}] [INFO]   monitors changed ({} -> {})",
+            local_time(),
+            self.monitors.len(),
+            new_monitors.len(),
+        );
+        for (i, mon) in new_monitors.iter().enumerate() {
+            eprintln!(
+                "[{}] [INFO]     monitor {}: '{}' {}x{}+{}+{}",
+                local_time(),
+                i,
+                mon.name,
+                mon.width,
+                mon.height,
+                mon.x,
+                mon.y,
+            );
+        }
+        self.monitors = new_monitors;
+
+        // Resize active_tags in lockstep with monitors. Three cases:
+        //   - len unchanged: keep existing entries (geometry-only RandR
+        //     change, common case for xrandr -s).
+        //   - len shrunk: truncate; clamp focused_monitor.
+        //   - len grew: append fresh entries, picking tags that aren't
+        //     already visible on existing monitors so newly-plugged
+        //     screens land on a previously-hidden tag rather than
+        //     duplicating an existing view.
+        let new_count = self.monitors.len();
+        let old_count = self.active_tags.len();
+        match new_count.cmp(&old_count) {
+            std::cmp::Ordering::Less => {
+                self.active_tags.truncate(new_count);
+            }
+            std::cmp::Ordering::Greater => {
+                for _ in old_count..new_count {
+                    let pick = (0..self.num_tags)
+                        .find(|t| !self.active_tags.contains(t))
+                        .unwrap_or_else(|| self.num_tags.saturating_sub(1));
+                    self.active_tags.push(pick);
+                }
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        if self.focused_monitor >= new_count {
+            self.focused_monitor = new_count - 1;
+        }
+
+        ewmh::set_workarea(
+            &self.conn,
+            self.root,
+            &self.atoms,
+            self.num_tags as u32,
+            &self.monitors,
+            self.bar_height,
+        );
+        ewmh::set_desktop_geometry(&self.conn, self.root, &self.atoms, &self.monitors);
+        ewmh::set_current_desktop(
+            &self.conn,
+            self.root,
+            &self.atoms,
+            self.active_tags[self.focused_monitor] as u32,
+        );
+
+        if let Some(ref mut bar) = self.bar {
+            if let Err(e) = bar.rebuild_panels(&self.conn, self.root, &self.atoms, &self.monitors) {
+                eprintln!(
+                    "[{}] [WARN]   bar rebuild failed: {}",
+                    local_time(),
+                    e,
+                );
+            }
+        }
+
+        // Visibility may have changed: a newly-attached monitor brings
+        // a previously-hidden tag's clients back into view; a detached
+        // monitor strands its tag's clients. Map/unmap accordingly.
+        self.refresh_visibility();
+
+        self.arrange();
+
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_all_dirty();
+        }
+
+        let _ = self.conn.flush();
+    }
+
+    // Map clients on visible tags, unmap clients on hidden tags. Idempotent
+    // map_window calls on already-mapped windows are no-ops at the X
+    // server, but we still bump unmap_ignore conservatively before each
+    // explicit unmap to swallow the echo.
+    fn refresh_visibility(&mut self) {
+        for client in &mut self.clients {
+            if self.active_tags.contains(&client.tag) {
+                let _ = self.conn.map_window(client.window);
+            } else {
+                client.unmap_ignore = client.unmap_ignore.saturating_add(1);
+                let _ = self.conn.unmap_window(client.window);
+            }
+        }
+    }
+
+    // The active tag for the focused monitor. Used by call sites that
+    // pre-v0.6.0 read self.active_tag as a global -- those paths now
+    // ask "what tag is the user currently viewing?" and we route to the
+    // focused monitor's slot. focused_monitor is always in-bounds (set
+    // by Wm::init, clamped on refresh_monitors), so this is infallible.
+    pub fn active_tag(&self) -> usize {
+        self.active_tags[self.focused_monitor]
+    }
+
+    // Is `tag` currently visible anywhere -- on any monitor? When false,
+    // clients on this tag are unmapped; when true, exactly one monitor
+    // shows them. The visibility flag is what gates map/unmap, replacing
+    // the old `tag == active_tag` check.
+    pub fn tag_visible(&self, tag: usize) -> bool {
+        self.active_tags.contains(&tag)
+    }
+
+    // Index of the monitor showing `tag`, if any. Tag-to-monitor is
+    // 1:1 (a tag is on at most one monitor at a time), enforced by the
+    // swap-on-collision logic in view_tag.
+    pub fn monitor_for_tag(&self, tag: usize) -> Option<usize> {
+        self.active_tags.iter().position(|&t| t == tag)
+    }
+
+    // Index in self.monitors of the monitor that owns `client`'s
+    // center point. Falls back to focused_monitor if the client is
+    // fully off-screen (e.g., dragged off a monitor that was then
+    // unplugged). Symmetric to client_monitor() which returns &Monitor.
+    pub fn client_monitor_index(&self, client: &Client) -> usize {
+        let cx = client.x + client.w as i32 / 2;
+        let cy = client.y + client.h as i32 / 2;
+        self.monitors
+            .iter()
+            .position(|m| {
+                cx >= m.x
+                    && cx < m.x + m.width as i32
+                    && cy >= m.y
+                    && cy < m.y + m.height as i32
+            })
+            .unwrap_or(self.focused_monitor)
+    }
+
     // Returns the monitor whose rect contains the client's center point.
-    // Falls back to monitors[0] if the client is fully off-screen.
+    // Falls back to the head monitor if the client is fully off-screen.
     pub fn client_monitor(&self, client: &Client) -> &Monitor {
         let cx = client.x + client.w as i32 / 2;
         let cy = client.y + client.h as i32 / 2;
@@ -1141,7 +1429,7 @@ impl Wm {
                     && cy >= m.y
                     && cy < m.y + m.height as i32
             })
-            .unwrap_or(&self.monitors[0])
+            .unwrap_or_else(|| self.monitors.first())
     }
 }
 

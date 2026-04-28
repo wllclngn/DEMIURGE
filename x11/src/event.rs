@@ -39,6 +39,12 @@ pub fn handle(wm: &mut Wm, event: Event) {
                 bar.mark_all_dirty();
             }
         }
+        // RandR change notifies. xrandr emits a flurry (CRTC + Output +
+        // ScreenChange) per invocation; we just set a dirty flag and let
+        // main::run drain everything before calling refresh_monitors once.
+        Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+            wm.monitors_dirty = true;
+        }
         _ => {}
     }
 }
@@ -54,15 +60,16 @@ fn on_map_request(wm: &mut Wm, ev: MapRequestEvent) {
 
     wm.manage(ev.window);
 
-    // Only map the window if it landed on the active tag. Tag-targeted
-    // spawns may route a new window to a background tag — leave those
-    // unmapped until the user views the target tag.
-    let on_active_tag = wm
+    // Only map the window if its tag is currently visible on some
+    // monitor. Tag-targeted spawns may route a new window to a tag
+    // that no monitor is showing -- leave those unmapped until a
+    // monitor views the target tag.
+    let visible = wm
         .clients
         .iter()
         .find(|c| c.window == ev.window)
-        .map_or(true, |c| c.tag == wm.active_tag);
-    if on_active_tag {
+        .map_or(true, |c| wm.tag_visible(c.tag));
+    if visible {
         let _ = wm.conn.map_window(ev.window);
     }
     let _ = wm.conn.flush();
@@ -191,14 +198,27 @@ fn on_property_notify(wm: &mut Wm, ev: PropertyNotifyEvent) {
 }
 
 fn on_button_press(wm: &mut Wm, ev: ButtonPressEvent) {
-    // Bar tag clicks
-    if let Some(ref bar) = wm.bar {
-        if bar.contains_window(ev.event) && ev.detail == 1 {
-            let x = ev.event_x as i32;
-            if let Some(tag) = bar.tag_extents.iter().position(|&(s, e)| x >= s && x < e) {
-                wm.view_tag(tag);
-                return;
+    // Bar tag clicks. The clicked panel's monitor becomes focused;
+    // then view_tag operates on that monitor's slot. This is how
+    // multi-monitor users redirect a tag to a specific physical screen
+    // -- click that screen's bar.
+    if let Some(panel_idx) = wm
+        .bar
+        .as_ref()
+        .filter(|b| b.contains_window(ev.event) && ev.detail == 1)
+        .and_then(|b| b.panel_index(ev.event))
+    {
+        let x = ev.event_x as i32;
+        let tag = wm
+            .bar
+            .as_ref()
+            .and_then(|b| b.tag_extents.iter().position(|&(s, e)| x >= s && x < e));
+        if let Some(tag) = tag {
+            if panel_idx < wm.monitors.len() {
+                wm.focused_monitor = panel_idx;
             }
+            wm.view_tag(tag);
+            return;
         }
     }
 

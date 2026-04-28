@@ -1,19 +1,24 @@
-// Torrentius: the rendering subsystem.
+// Torrentius (core): the rendering subsystem's server-agnostic parts.
 //
-// Named for Johannes Torrentius, the 17th-century Dutch painter who reportedly
-// used a camera obscura -- a dark chamber that projects the outside world as
-// a visible image. This module is DEMIURGE's equivalent apparatus: light (X11
-// pixel buffers) rendered into visible form (Cairo surfaces, bar glyphs,
-// screenshots). Every drawing primitive in the WM lives here.
-
-use std::path::Path;
-
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Window};
-use x11rb::rust_connection::RustConnection;
+// Named for Johannes Torrentius, the 17th-century Dutch painter who
+// reportedly used a camera obscura -- a dark chamber that projects
+// the outside world as a visible image. This module is DEMIURGE's
+// equivalent apparatus: light rendered into visible form (Cairo
+// surfaces, bar glyphs).
+//
+// What's here: pure Cairo + Pango primitives that are blit-target-
+// agnostic. Both the X11 implementation (XPutImage from a Cairo
+// surface into an XImage) and the Wayland implementation (Cairo
+// surface uploaded to a wl_shm buffer or a GL texture) consume them
+// unchanged.
+//
+// What's *not* here: protocol-specific I/O. X11's get_image-based
+// capture lives in `demiurge-x11`'s torrentius module; the Wayland
+// equivalent (zwlr_screencopy or session-lock screenshot mechanisms)
+// lands in `demiurge-wl` when those features are added.
 
 // Colors for a framed panel. RGB triples in [0.0, 1.0].
-// Used by GORDIAN KNOT's X11 lock screen, not by DEMIURGE's bar.
-#[allow(dead_code)]
+// Used by GORDIAN KNOT's lock screen, not by the bar.
 #[derive(Clone, Copy)]
 pub struct PanelColors {
     pub bg: (f64, f64, f64),
@@ -23,7 +28,6 @@ pub struct PanelColors {
 }
 
 // Two-column row. label on the left, value right-aligned.
-#[allow(dead_code)]
 pub struct PanelRow<'a> {
     pub label: &'a str,
     pub value: &'a str,
@@ -33,7 +37,6 @@ pub struct PanelRow<'a> {
 // in the accent color, left-aligned labels + right-aligned values. Font is
 // whatever the caller set on `layout` via set_font_description beforehand.
 // (x, y) is the top-left of the panel; (w, h) its size in pixels.
-#[allow(dead_code)]
 pub fn draw_panel(
     cr: &cairo::Context,
     layout: &pango::Layout,
@@ -45,20 +48,15 @@ pub fn draw_panel(
     rows: &[PanelRow<'_>],
     colors: &PanelColors,
 ) {
-    // Panel background (subtle if it differs from page bg; harmless if same).
     cr.set_source_rgb(colors.bg.0, colors.bg.1, colors.bg.2);
     cr.rectangle(x, y, w, h);
     let _ = cr.fill();
 
-    // Border, 1 px, drawn inside the rect.
     cr.set_source_rgb(colors.border.0, colors.border.1, colors.border.2);
     cr.set_line_width(1.0);
     cr.rectangle(x + 0.5, y + 0.5, w - 1.0, h - 1.0);
     let _ = cr.stroke();
 
-    // Label: "─── SYSTEM ───" floating over the top border, in accent color.
-    // Rendered by punching a gap in the border with a bg-colored rect, then
-    // drawing the label text on top of that gap.
     layout.set_text(&format!(" {} ", label));
     let (label_w, label_h) = layout.pixel_size();
     let label_x = x + 20.0;
@@ -70,8 +68,6 @@ pub fn draw_panel(
     cr.move_to(label_x, label_y);
     pangocairo::functions::show_layout(cr, layout);
 
-    // Rows. Label left-aligned, value right-aligned, same row baseline.
-    // Row pitch derived from layout's line height for the current font.
     layout.set_text("Ag");
     let (_, row_h) = layout.pixel_size();
     let row_pitch = (row_h as f64) * 1.25;
@@ -95,7 +91,6 @@ pub fn draw_panel(
 
 // Compute the pixel height a panel needs to hold `n` rows with the given
 // font (set on layout). Useful for stacking panels without hardcoding.
-#[allow(dead_code)]
 pub fn panel_height_for(layout: &pango::Layout, rows: usize) -> f64 {
     layout.set_text("Ag");
     let (_, row_h) = layout.pixel_size();
@@ -119,12 +114,6 @@ pub fn make_font_options() -> Result<cairo::FontOptions, String> {
 
 // Allocate a fresh opaque RGB24 surface + context sized to w x h pixels.
 // Returns Err on allocation failure; callers typically `continue` on err.
-//
-// Used by GORDIAN KNOT's lock screen (re-allocated per redraw because the
-// lock UI is short-lived). The DEMIURGE bar uses a pinned surface
-// allocated once in Bar::create -- per-binary dead-code analysis flags
-// this when only the bar binary is built, hence the allow.
-#[allow(dead_code)]
 pub fn new_surface(w: i32, h: i32) -> Result<(cairo::ImageSurface, cairo::Context), String> {
     let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, w, h)
         .map_err(|e| format!("cairo surface {}x{}: {}", w, h, e))?;
@@ -145,79 +134,11 @@ pub fn parse_hex(color: &str) -> (f64, f64, f64) {
     (r, g, b)
 }
 
-// Parse "#RRGGBB" into the 0xRRGGBB pixel value X11 wants for background_pixel.
+// Parse "#RRGGBB" into the 0xRRGGBB packed value. X11 takes this as
+// background_pixel; Wayland takes it (with 0xFF000000 OR'd in for
+// alpha) as the RGB channels of an ARGB32 wl_shm buffer. Same bit
+// layout in both cases.
 pub fn hex_to_pixel(color: &str) -> u32 {
     let s = color.trim_start_matches('#');
     u32::from_str_radix(s, 16).unwrap_or(0)
-}
-
-// Grab the full root window as a PNG. Uses X11 ZPixmap get_image, converts
-// to cairo's ARGB32 layout (X returns BGRA on little-endian truecolor), and
-// writes via cairo's PNG encoder.
-pub fn capture_root_to_png(
-    conn: &RustConnection,
-    root: Window,
-    path: &Path,
-) -> Result<(), String> {
-    let geom = conn
-        .get_geometry(root)
-        .map_err(|e| format!("get_geometry: {}", e))?
-        .reply()
-        .map_err(|e| format!("get_geometry reply: {}", e))?;
-    capture_region_to_png(conn, root, 0, 0, geom.width as u32, geom.height as u32, path)
-}
-
-pub fn capture_region_to_png(
-    conn: &RustConnection,
-    drawable: Window,
-    x: i16,
-    y: i16,
-    w: u32,
-    h: u32,
-    path: &Path,
-) -> Result<(), String> {
-    let reply = conn
-        .get_image(ImageFormat::Z_PIXMAP, drawable, x, y, w as u16, h as u16, !0u32)
-        .map_err(|e| format!("get_image: {}", e))?
-        .reply()
-        .map_err(|e| format!("get_image reply: {}", e))?;
-
-    // X11 ZPixmap on modern truecolor visuals is 32-bit little-endian BGRA
-    // (or BGRX if depth=24). Cairo's ARGB32 on little-endian is also BGRA
-    // in memory. So the pixel layout passes through with an alpha fill.
-    let stride =
-        cairo::Format::Rgb24.stride_for_width(w).map_err(|e| format!("stride: {}", e))?;
-    let mut surface =
-        cairo::ImageSurface::create(cairo::Format::Rgb24, w as i32, h as i32)
-            .map_err(|e| format!("surface: {}", e))?;
-
-    {
-        let mut data = surface.data().map_err(|e| format!("surface data: {}", e))?;
-        let src = &reply.data;
-        let row_bytes = (w * 4) as usize;
-        let stride = stride as usize;
-        let h_usize = h as usize;
-        if src.len() < row_bytes * h_usize {
-            return Err(format!(
-                "get_image returned {} bytes, expected {}",
-                src.len(),
-                row_bytes * h_usize
-            ));
-        }
-        for row in 0..h_usize {
-            let src_off = row * row_bytes;
-            let dst_off = row * stride;
-            data[dst_off..dst_off + row_bytes]
-                .copy_from_slice(&src[src_off..src_off + row_bytes]);
-        }
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {:?}: {}", parent, e))?;
-    }
-    let mut file = std::fs::File::create(path).map_err(|e| format!("create {:?}: {}", path, e))?;
-    surface
-        .write_to_png(&mut file)
-        .map_err(|e| format!("write_to_png: {}", e))?;
-    Ok(())
 }

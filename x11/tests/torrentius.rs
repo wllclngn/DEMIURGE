@@ -3,7 +3,7 @@
 // screenshot paths are left to manual testing via demiurge's Screenshot
 // action in a live session.
 
-use demiurge::torrentius::{hex_to_pixel, make_font_options, new_surface, parse_hex};
+use demiurge_x11::torrentius::{hex_to_pixel, make_font_options, new_surface, parse_hex};
 
 #[test]
 fn parse_hex_black() {
