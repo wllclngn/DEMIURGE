@@ -17,7 +17,7 @@ path = "src/bin/gordian_knot.rs"
 
 [dependencies]
 demiurge-core = { path = "../core" }
-x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver"] }
+x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver", "xfixes", "dpms"] }
 cairo-rs = { version = "0.20", features = ["png"] }
 pangocairo = "0.20"
 pango = "0.20"

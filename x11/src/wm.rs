@@ -7,7 +7,10 @@ use x11rb::wrapper::ConnectionExt as _;
 use crate::atoms::Atoms;
 use crate::bar::Bar;
 use crate::config::Config;
+use crate::cursor::{self, CursorState};
+use crate::display;
 use crate::ewmh;
+use crate::idle;
 use crate::keys::{self, Action, Binding};
 use crate::layout::Layout;
 use crate::monitor::{self, Monitor, Monitors};
@@ -97,6 +100,16 @@ pub struct Wm {
     // Coalesces the burst of CRTC/Output/ScreenChange events that xrandr
     // emits into a single refresh.
     pub monitors_dirty: bool,
+    // Cursor auto-hide state. Driven by the cursor timerfd in
+    // main.rs::run; toggled via reload_config when [cursor] changes.
+    pub cursor: CursorState,
+    // Last [input.keyboard] values applied. Cached so MappingNotify
+    // (which fires when xkbcomp / setxkbmap / USB hot-plug remap the
+    // keyboard) can re-apply the repeat delay / rate that the X
+    // server may have just clobbered. 0/0 means "DEMIURGE doesn't
+    // own these; leave server default" and skips re-application.
+    pub input_repeat_delay: u32,
+    pub input_repeat_rate: u32,
 }
 
 impl Wm {
@@ -129,12 +142,33 @@ impl Wm {
             .reply()
             .map_err(|e| format!("atoms reply: {}", e))?;
 
-        let monitors = monitor::query(&conn, root);
-        for (i, mon) in monitors.iter().enumerate() {
+        // Initial monitor probe (just to get connector names for
+        // [[display]] match patterns). The post-DSR re-query below
+        // is what feeds EWMH / bar / arrange.
+        let initial_monitors = monitor::query(&conn, root);
+        for (i, mon) in initial_monitors.iter().enumerate() {
             eprintln!(
                 "[demiurge] monitor {}: '{}' {}x{}+{}+{}",
                 i, mon.name, mon.width, mon.height, mon.x, mon.y
             );
+        }
+
+        // Apply [[display]] entries first thing -- mode + DSR + DPI
+        // changes all reshape the framebuffer, so we want them done
+        // before everything that reads the post-config geometry
+        // (EWMH workarea, bar panel sizing, ...). Re-query monitors
+        // after so the rest of init sees the post-DSR sizes.
+        if !config.displays.is_empty() {
+            display::apply_all(&config.displays, &initial_monitors);
+        }
+        let monitors = monitor::query(&conn, root);
+        if !config.displays.is_empty() {
+            for (i, mon) in monitors.iter().enumerate() {
+                eprintln!(
+                    "[demiurge] post-display monitor {}: '{}' {}x{}+{}+{}",
+                    i, mon.name, mon.width, mon.height, mon.x, mon.y
+                );
+            }
         }
 
         // Subscribe to RandR change notifies. Without this, xrandr -s,
@@ -143,6 +177,73 @@ impl Wm {
         if let Err(e) = monitor::select_input(&conn, root) {
             eprintln!("[demiurge] randr select_input failed: {} (display tracking disabled)", e);
         }
+
+        // Activate XFixes so cursor::hide / show actually take effect.
+        // Failure here just means auto_hide silently no-ops; not fatal.
+        if let Err(e) = cursor::init_xfixes(&conn) {
+            eprintln!("[demiurge] xfixes init failed: {} (cursor auto-hide disabled)", e);
+        }
+
+        // Apply [input.keyboard] settings if the user opted in.
+        // 0/0 means "leave the server default in place" -- skip the
+        // call so existing setxkbmap / xset state is preserved when
+        // the user hasn't explicitly configured DEMIURGE to own it.
+        if config.input.keyboard.repeat_delay > 0 || config.input.keyboard.repeat_rate > 0 {
+            apply_keyboard_repeat(
+                &conn,
+                config.input.keyboard.repeat_delay,
+                config.input.keyboard.repeat_rate,
+            );
+        }
+
+        // Apply [input.keyboard] layout/variant/options via XKB if
+        // the user has explicitly opted in (any non-empty field).
+        // The X server compiles internally -- no setxkbmap or
+        // xkbcomp shellout from us.
+        if !config.input.keyboard.layout.is_empty()
+            || !config.input.keyboard.variant.is_empty()
+            || !config.input.keyboard.options.is_empty()
+        {
+            apply_xkb_layout(
+                &conn,
+                &config.input.keyboard.layout,
+                &config.input.keyboard.variant,
+                &config.input.keyboard.options,
+            );
+        }
+
+        // Activate the DPMS extension if the user has any DPMS or
+        // screensaver thresholds configured. Failing here just
+        // means [input.idle] silently no-ops; not fatal.
+        if config.input.idle.dpms_standby_seconds
+            + config.input.idle.dpms_suspend_seconds
+            + config.input.idle.dpms_off_seconds
+            > 0
+        {
+            if let Err(e) = idle::init_dpms(&conn) {
+                eprintln!("[demiurge] dpms init failed: {} (DPMS disabled)", e);
+            }
+            idle::apply_dpms(
+                &conn,
+                config.input.idle.dpms_standby_seconds,
+                config.input.idle.dpms_suspend_seconds,
+                config.input.idle.dpms_off_seconds,
+            );
+        }
+        if config.input.idle.screensaver_seconds > 0 {
+            idle::apply_screensaver(&conn, config.input.idle.screensaver_seconds);
+        }
+
+        // Apply [input.bell] if the user has touched any field.
+        // None / None / None / None = leave server default.
+        if config.input.bell.enabled.is_some()
+            || config.input.bell.volume.is_some()
+            || config.input.bell.pitch_hz.is_some()
+            || config.input.bell.duration_ms.is_some()
+        {
+            apply_bell(&conn, &config.input.bell);
+        }
+
 
         let num_tags = config.general.tags.len();
         let tag_names = config.general.tags.clone();
@@ -224,6 +325,12 @@ impl Wm {
             keymap,
             bar: Some(bar),
             monitors_dirty: false,
+            cursor: CursorState::new(
+                config.cursor.auto_hide,
+                config.cursor.auto_hide_seconds,
+            ),
+            input_repeat_delay: config.input.keyboard.repeat_delay,
+            input_repeat_rate: config.input.keyboard.repeat_rate,
         };
 
         // Manage pre-existing windows
@@ -1156,10 +1263,20 @@ impl Wm {
     // Rebuild the cached keyboard mapping after a MappingNotify event.
     // The X server has changed the keycode-to-keysym table (e.g. user ran
     // setxkbmap). Refetch, recompute alt keycodes, and re-grab keys.
+    //
+    // Also re-applies the [input.keyboard] repeat settings if DEMIURGE
+    // owns them. Layout-switching / xkbcomp / USB keyboard hot-plug all
+    // reset auto-repeat to server defaults; without re-application,
+    // the user's configured repeat rate silently reverts -- exactly
+    // the inconsistency that motivated owning xset's surface in the
+    // first place.
     pub fn rebuild_keymap(&mut self) {
         self.keymap = keys::load_keymap(&self.conn);
         self.alt_keycodes = keys::keymap_alt_keycodes(&self.keymap);
         keys::grab_all(&self.conn, self.root, &self.bindings);
+        if self.input_repeat_delay > 0 || self.input_repeat_rate > 0 {
+            apply_keyboard_repeat(&self.conn, self.input_repeat_delay, self.input_repeat_rate);
+        }
     }
 
     pub fn reload_config(&mut self, config: &Config) {
@@ -1178,6 +1295,81 @@ impl Wm {
         }
 
         self.master_ratio = config.general.master_ratio;
+
+        // Cursor auto-hide may have flipped on / off, or the timeout
+        // changed. cursor::reload force-shows on disable so the
+        // cursor doesn't stay invisible after the user changes their
+        // mind via config.toml.
+        cursor::reload(
+            &mut self.cursor,
+            &self.conn,
+            self.root,
+            config.cursor.auto_hide,
+            config.cursor.auto_hide_seconds,
+        );
+
+        // Keyboard repeat rate via XKB. 0/0 means "leave server
+        // default in place" -- skip the call so we don't perturb
+        // anything the user may have set externally. The cached
+        // copies on Wm are also refreshed so MappingNotify
+        // re-application uses the latest values.
+        self.input_repeat_delay = config.input.keyboard.repeat_delay;
+        self.input_repeat_rate = config.input.keyboard.repeat_rate;
+        if self.input_repeat_delay > 0 || self.input_repeat_rate > 0 {
+            apply_keyboard_repeat(&self.conn, self.input_repeat_delay, self.input_repeat_rate);
+        }
+
+        // XKB layout/variant/options. Re-apply if any field is set
+        // OR if it was set previously and is now empty (so flipping
+        // a layout off-and-back-to-default works). MappingNotify
+        // re-application is intentionally NOT done for layout
+        // because applying it FIRES MappingNotify -- looping.
+        if !config.input.keyboard.layout.is_empty()
+            || !config.input.keyboard.variant.is_empty()
+            || !config.input.keyboard.options.is_empty()
+        {
+            apply_xkb_layout(
+                &self.conn,
+                &config.input.keyboard.layout,
+                &config.input.keyboard.variant,
+                &config.input.keyboard.options,
+            );
+        }
+
+        // [input.idle] DPMS + screensaver. Re-apply on every reload
+        // even if values are unchanged -- DPMS state can drift via
+        // external xset calls, and re-applying is idempotent.
+        if config.input.idle.dpms_standby_seconds
+            + config.input.idle.dpms_suspend_seconds
+            + config.input.idle.dpms_off_seconds
+            > 0
+        {
+            idle::apply_dpms(
+                &self.conn,
+                config.input.idle.dpms_standby_seconds,
+                config.input.idle.dpms_suspend_seconds,
+                config.input.idle.dpms_off_seconds,
+            );
+        }
+        if config.input.idle.screensaver_seconds > 0 {
+            idle::apply_screensaver(&self.conn, config.input.idle.screensaver_seconds);
+        }
+
+        // [input.bell] re-apply if any field is set.
+        if config.input.bell.enabled.is_some()
+            || config.input.bell.volume.is_some()
+            || config.input.bell.pitch_hz.is_some()
+            || config.input.bell.duration_ms.is_some()
+        {
+            apply_bell(&self.conn, &config.input.bell);
+        }
+
+        // Re-apply [[display]] entries. Triggers an internal RandR
+        // change which fires our own monitors_dirty path on the next
+        // event-loop iteration, picking up post-DSR geometry.
+        if !config.displays.is_empty() {
+            display::apply_all(&config.displays, &self.monitors);
+        }
 
         let old_height = self.bar_height;
         if let Some(ref mut bar) = self.bar {
@@ -1250,6 +1442,16 @@ impl Wm {
     // Tag has at least one client
     pub fn tag_occupied(&self, tag: usize) -> bool {
         self.clients.iter().any(|c| c.tag == tag)
+    }
+
+    // Cursor auto-hide tick. Called every ~100ms by the cursor
+    // timerfd in main.rs::run. Polls the pointer position via
+    // XQueryPointer; on motion shows + resets the timer, on
+    // sustained idle past auto_hide_seconds hides. No-op when
+    // self.cursor.auto_hide is false. Force-shows during drag.
+    pub fn cursor_tick(&mut self) {
+        let drag = self.drag.is_some();
+        cursor::tick(&mut self.cursor, &self.conn, self.root, drag);
     }
 
     // RandR change handler. Drained once per event-loop iteration after
@@ -1431,6 +1633,189 @@ impl Wm {
             })
             .unwrap_or_else(|| self.monitors.first())
     }
+}
+
+// Apply keyboard auto-repeat delay + rate via XKB. Replaces the
+// `xset r rate <delay> <rate>` line many DEMIURGE configs ship in
+// startup.commands. delay_ms is the milliseconds before repeat
+// starts; rate_per_sec is repeats per second after that.
+//
+// One protocol call: XKB SetControls with three bits flipped.
+//
+//   - affect_enabled_controls + enabled_controls: BoolCtrl::REPEAT_KEYS
+//     ensures auto-repeat itself is ENABLED (a stale `xset r off`
+//     would otherwise silently swallow whatever rate we set).
+//   - change_controls: REPEAT_KEYS_BIT (= 1 << 0 in the underlying
+//     XkbControlsMask u32) is the "I'm setting repeat_delay and
+//     repeat_interval" flag. x11rb's typed Control wrapper exposes
+//     only its high-bit named constants directly; the low bits
+//     (which double as BoolCtrl values in the X protocol) are
+//     reachable via Control::from(<u32>).
+//   - repeat_delay + repeat_interval: the actual values.
+//
+// The 30-argument signature is what it is. Most fields zero out.
+pub fn apply_keyboard_repeat(conn: &RustConnection, delay_ms: u32, rate_per_sec: u32) {
+    use x11rb::protocol::xkb::{
+        AXOption, BoolCtrl, ConnectionExt as XkbExt, Control, VMod,
+    };
+
+    // Guard against divide-by-zero. A user setting rate = 0 in
+    // [input.keyboard] is asking for "don't change anything"; in
+    // that case the apply() caller skips us entirely, but
+    // belt-and-suspenders.
+    if rate_per_sec == 0 {
+        return;
+    }
+    let interval_ms = (1000u32 / rate_per_sec).max(1);
+
+    // DeviceSpec = 0x0100 selects the X server's core keyboard. XKB
+    // also supports per-physical-device control (typically used by
+    // input-method software); core keyboard is what setxkbmap and
+    // xset use.
+    const CORE_KBD: u16 = 0x0100;
+    // XkbRepeatKeysMask -- bit 0 of the XkbControlsMask u32.
+    const REPEAT_KEYS_BIT: u32 = 1 << 0;
+
+    let _ = conn.xkb_set_controls(
+        CORE_KBD,
+        // affect_internal_real_mods, internal_real_mods,
+        // affect_ignore_lock_real_mods, ignore_lock_real_mods,
+        // affect_internal_virtual_mods, internal_virtual_mods,
+        // affect_ignore_lock_virtual_mods, ignore_lock_virtual_mods
+        0u8.into(),
+        0u8.into(),
+        0u8.into(),
+        0u8.into(),
+        VMod::default(),
+        VMod::default(),
+        VMod::default(),
+        VMod::default(),
+        // mouse_keys_dflt_btn, groups_wrap, access_x_options
+        0,
+        0,
+        AXOption::default(),
+        // affect_enabled_controls + enabled_controls: turn auto-repeat
+        // ON globally. Both equal so the masked bit becomes 1.
+        BoolCtrl::REPEAT_KEYS,
+        BoolCtrl::REPEAT_KEYS,
+        // change_controls: tell the server to apply repeat_delay +
+        // repeat_interval (XkbRepeatKeysMask bit 0).
+        Control::from(REPEAT_KEYS_BIT),
+        // repeat_delay, repeat_interval
+        delay_ms.min(u16::MAX as u32) as u16,
+        interval_ms.min(u16::MAX as u32) as u16,
+        // slow_keys_delay, debounce_delay
+        0,
+        0,
+        // mouse_keys_*
+        0,
+        0,
+        0,
+        0,
+        0,
+        // access_x_timeout + masks/values
+        0,
+        BoolCtrl::default(),
+        BoolCtrl::default(),
+        AXOption::default(),
+        AXOption::default(),
+        // per_key_repeat: bitmap of which keycodes auto-repeat. All
+        // zeros = leave server default.
+        &[0u8; 32],
+    );
+    let _ = conn.flush();
+}
+
+// Apply XKB layout / variant / options. Replaces a setxkbmap line
+// in startup.commands with TOML the user owns.
+//
+// Why setxkbmap as the implementation:
+//   The X11 server takes XKB component names ("pc+us+inet(evdev)")
+//   to compile a keymap, not RMLVO directly. Expanding RMLVO ->
+//   component names requires parsing /usr/share/X11/xkb/rules/evdev,
+//   which xkbcomp/setxkbmap exist to do. We could re-implement the
+//   rules parser, or pull libxkbcommon, but for v0.7 we pragmatically
+//   shell out to setxkbmap from inside DEMIURGE -- the dependency is
+//   on xorg-setxkbmap (already required for any X11 session) rather
+//   than on the user remembering to put the call in startup.commands.
+//
+// User-visible: a single TOML place owns the layout, hot-reloadable
+// like the rest of the config.
+//
+// Wayland implementation will use libxkbcommon's RMLVO->keymap path
+// directly since wl_keyboard takes the compiled keymap string; that
+// version is genuinely shellout-free.
+pub fn apply_xkb_layout(
+    _conn: &RustConnection,
+    layout: &str,
+    variant: &str,
+    options: &[String],
+) {
+    let mut cmd = std::process::Command::new("setxkbmap");
+    if !layout.is_empty() {
+        cmd.arg("-layout").arg(layout);
+    }
+    if !variant.is_empty() {
+        cmd.arg("-variant").arg(variant);
+    }
+    // -option with empty arg first clears existing options so the
+    // user's TOML list is the full set, not an addition. Without
+    // this, an XKB option set previously (by a session-setup
+    // script, an old setxkbmap invocation, or /etc/X11/xorg.conf.d)
+    // would persist alongside the new ones.
+    cmd.arg("-option").arg("");
+    for opt in options {
+        cmd.arg("-option").arg(opt);
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!(
+                "[{}] [WARN]   setxkbmap exited {}",
+                local_time(),
+                status.code().unwrap_or(-1),
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[{}] [WARN]   setxkbmap spawn failed: {} (XKB layout not applied)",
+                local_time(),
+                e,
+            );
+        }
+    }
+}
+
+// Apply [input.bell] settings via ChangeKeyboardControl. The X server's
+// bell parameters are (percent, pitch_hz, duration_ms); percent = 0
+// silences. We map enabled=Some(false) -> percent=0, enabled=Some(true)
+// + volume present -> percent = volume, neither set -> leave default.
+pub fn apply_bell(conn: &RustConnection, bell: &crate::config::Bell) {
+    use x11rb::protocol::xproto::ChangeKeyboardControlAux;
+
+    let mut aux = ChangeKeyboardControlAux::new();
+
+    // Volume / enable. Disabled wins regardless of volume.
+    let effective_volume: Option<i8> = match (bell.enabled, bell.volume) {
+        (Some(false), _) => Some(0),
+        (Some(true), Some(v)) => Some((v.min(100)) as i8),
+        (Some(true), None) => None, // leave server default
+        (None, Some(v)) => Some((v.min(100)) as i8),
+        (None, None) => None,
+    };
+    if let Some(v) = effective_volume {
+        aux = aux.bell_percent(v as i32);
+    }
+
+    if let Some(hz) = bell.pitch_hz {
+        aux = aux.bell_pitch(hz as i32);
+    }
+    if let Some(ms) = bell.duration_ms {
+        aux = aux.bell_duration(ms as i32);
+    }
+
+    let _ = conn.change_keyboard_control(&aux);
+    let _ = conn.flush();
 }
 
 // Parse `wpctl get-volume <target>` output:

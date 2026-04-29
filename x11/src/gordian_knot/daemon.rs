@@ -15,12 +15,16 @@ use x11rb::connection::Connection;
 use x11rb::protocol::screensaver::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
-use crate::config::GordianKnot as Cfg;
 use crate::gordian_knot::inhibit;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-pub fn run(cfg: &Cfg, self_binary: &str) -> i32 {
+// `threshold_seconds` is the resolved idle threshold from the config.
+// The caller picks input.idle.lock_seconds when set, else falls back
+// to the legacy gordian_knot.idle_timeout_seconds. We don't know
+// which source was authoritative -- doesn't matter for the daemon's
+// job; it just polls and triggers.
+pub fn run(threshold_seconds: u64, self_binary: &str) -> i32 {
     let (conn, screen_num) = match RustConnection::connect(None) {
         Ok(c) => c,
         Err(e) => {
@@ -41,12 +45,12 @@ pub fn run(cfg: &Cfg, self_binary: &str) -> i32 {
         return 1;
     }
 
-    let threshold_ms = cfg.idle_timeout_seconds.saturating_mul(1000);
+    let threshold_ms = threshold_seconds.saturating_mul(1000);
     let mut inhibitor = inhibit::Watcher::new();
 
     eprintln!(
         "[gordian_knot-daemon] watching idle; threshold {}s, poll {}s",
-        cfg.idle_timeout_seconds,
+        threshold_seconds,
         POLL_INTERVAL.as_secs()
     );
 
@@ -81,7 +85,7 @@ pub fn run(cfg: &Cfg, self_binary: &str) -> i32 {
         eprintln!(
             "[gordian_knot-daemon] idle {}s >= {}s, triggering lock",
             idle_ms / 1000,
-            cfg.idle_timeout_seconds
+            threshold_seconds
         );
         last_lock_at = Some(Instant::now());
         if let Err(e) = spawn_locker(self_binary) {

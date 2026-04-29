@@ -228,6 +228,113 @@ def should_replace_config(args) -> bool:
         return True
 
 
+# PROMPTS / PHASE ORCHESTRATION
+#
+# DEMIURGE ships as a workspace: the WM proper, GORDIAN KNOT, and two
+# sibling daemons (ABRAXAS + cherrypie). Each subproject has its own
+# install.py with its own concerns (binary paths, systemd units,
+# config defaults). Rather than re-derive that logic here, this
+# orchestrator prompts up-front for which sub-installs to run, then
+# delegates by calling the subproject installers as subprocesses.
+# Modeled on montauk/install.py's phase-and-prompt pattern.
+
+def phase(name: str) -> None:
+    """Print a phase banner. Called between major install steps."""
+    print()
+    log_info(f"PHASE: {name}")
+
+
+def prompt_yn(question: str, default_yes: bool = True) -> bool:
+    """Y/N prompt with EOF fallback. default_yes governs both the
+    bracket display ([Y/n] vs [y/N]) and the "blank Enter" / EOF
+    answer."""
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        while True:
+            response = input(f"{question} {suffix}: ").strip().lower()
+            if not response:
+                return default_yes
+            if response in ("y", "yes"):
+                return True
+            if response in ("n", "no"):
+                return False
+    except EOFError:
+        print()
+        return default_yes
+
+
+def prompt_abraxas() -> bool:
+    log_info("ABRAXAS: dynamic color-temperature daemon (replaces redshift).")
+    log_info("  - Solar grayline + sigmoid transitions across the day")
+    log_info("  - Optional NOAA cloud-cover weather awareness")
+    log_info("  - Per-output gamma via X11 RandR / DRM / Wayland / GNOME D-Bus")
+    print()
+    return prompt_yn("Install ABRAXAS?", default_yes=True)
+
+
+def prompt_cherrypie() -> bool:
+    log_info("cherrypie: window-matching daemon (replaces devilspie / devilspie2).")
+    log_info("  - TOML rules + regex over WM_CLASS / title / role / process")
+    log_info("  - RandR-aware multi-monitor placement; hot-reload")
+    print()
+    return prompt_yn("Install cherrypie?", default_yes=True)
+
+
+def resolve_abraxas(args) -> bool:
+    """--abraxas: yes; --no-abraxas: no; -y: yes; otherwise prompt."""
+    if args.no_abraxas:
+        return False
+    if args.abraxas:
+        return True
+    if args.yes:
+        return True
+    return prompt_abraxas()
+
+
+def resolve_cherrypie(args) -> bool:
+    if args.no_cherrypie:
+        return False
+    if args.cherrypie:
+        return True
+    if args.yes:
+        return True
+    return prompt_cherrypie()
+
+
+def delegate_install(installer: Path, extra_args: list[str]) -> bool:
+    """Run a subproject installer as a subprocess. The subproject
+    knows its own binary paths + systemd units; we just point at
+    the installer and let it do its work."""
+    if not installer.exists():
+        log_error(f"Subproject installer not found: {installer}")
+        return False
+    log_info(f"Delegating to {installer}")
+    cmd = [sys.executable, str(installer), "install"] + extra_args
+    ret = run_cmd(cmd)
+    return ret == 0
+
+
+def install_abraxas(source_dir: Path) -> bool:
+    # ABRAXAS is Rust-only as of v0.7.0 (the C23 source tree under
+    # ABRAXAS/c23/ stays in place but is unwired from the install
+    # path). The subproject installer handles its own NOAA prompt
+    # and service setup.
+    return delegate_install(source_dir / "ABRAXAS" / "install.py", [])
+
+
+def install_cherrypie(source_dir: Path) -> bool:
+    return delegate_install(source_dir / "cherrypie" / "install.py", [])
+
+
+def delegate_uninstall(installer: Path) -> bool:
+    if not installer.exists():
+        log_warn(f"Subproject installer not found (skipping): {installer}")
+        return True
+    log_info(f"Delegating uninstall to {installer}")
+    ret = run_cmd([sys.executable, str(installer), "uninstall"])
+    return ret == 0
+
+
 # BUILD
 
 def build_demiurge(source_dir: Path) -> bool:
@@ -262,7 +369,18 @@ def build_demiurge(source_dir: Path) -> bool:
 # COMMANDS
 
 def cmd_install(args, source_dir: Path) -> bool:
-    log_info("Installing DEMIURGE")
+    # Resolve sub-component choices up front, before any work begins,
+    # so the user can walk away once the prompts are answered. The
+    # phases below run unattended.
+    do_abraxas = resolve_abraxas(args)
+    do_cherrypie = resolve_cherrypie(args)
+    print()
+    log_info("Plan:")
+    log_info("  - DEMIURGE WM + GORDIAN KNOT: yes")
+    log_info(f"  - ABRAXAS: {'yes' if do_abraxas else 'skip'}")
+    log_info(f"  - cherrypie: {'yes' if do_cherrypie else 'skip'}")
+
+    phase("DEMIURGE WM + GORDIAN KNOT")
 
     source_binary = BUILD_DIR / "release" / "demiurge"
     source_config = source_dir / "config.default.toml"
@@ -327,7 +445,7 @@ def cmd_install(args, source_dir: Path) -> bool:
         return False
 
     print()
-    log_info("Installation complete")
+    log_info("DEMIURGE WM + GORDIAN KNOT installed")
     log_info(f"Binary:       {INSTALL_BINARY}")
     log_info(f"Session:      {INSTALL_DESKTOP}")
     log_info(f"Service:      {INSTALL_SERVICE}")
@@ -336,7 +454,29 @@ def cmd_install(args, source_dir: Path) -> bool:
     log_info(f"Locker PAM:   {INSTALL_GK_PAM}")
     log_info(f"Idle daemon:  {INSTALL_GK_DAEMON_SERVICE}")
     log_info(f"Sleep lock:   {INSTALL_GK_SLEEP_SERVICE}")
+
+    # Sibling daemons. If the sub-install fails, we log+continue
+    # rather than aborting the whole orchestration -- a partial
+    # desktop is more useful than rolling everything back.
+    abraxas_ok = True
+    cherrypie_ok = True
+
+    if do_abraxas:
+        phase("ABRAXAS color-temperature daemon")
+        abraxas_ok = install_abraxas(source_dir)
+        if not abraxas_ok:
+            log_warn("ABRAXAS install failed; continuing with rest")
+
+    if do_cherrypie:
+        phase("cherrypie window-matching daemon")
+        cherrypie_ok = install_cherrypie(source_dir)
+        if not cherrypie_ok:
+            log_warn("cherrypie install failed; continuing with rest")
+
     print()
+    log_info("Installation complete")
+    if not (abraxas_ok and cherrypie_ok):
+        log_warn("Some sub-installs failed; see PHASE logs above for details.")
     log_info("Log out and select 'DEMIURGE' in your display manager to launch.")
     return True
 
@@ -469,7 +609,20 @@ def cmd_update(args, source_dir: Path) -> bool:
 
 
 def cmd_uninstall(args, source_dir: Path) -> bool:
+    # Resolve sibling-daemon choices up front. Same flag semantics as
+    # install: --no-X skips, --X explicit yes, -y yes-to-all,
+    # otherwise prompt. "Yes" here means "uninstall it"; we let the
+    # subproject's own uninstaller handle its bits.
+    do_abraxas = resolve_abraxas(args)
+    do_cherrypie = resolve_cherrypie(args)
+
     log_info("Uninstalling DEMIURGE")
+    log_info("Plan:")
+    log_info("  - DEMIURGE WM + GORDIAN KNOT: yes")
+    log_info(f"  - ABRAXAS: {'yes' if do_abraxas else 'skip'}")
+    log_info(f"  - cherrypie: {'yes' if do_cherrypie else 'skip'}")
+
+    phase("DEMIURGE WM + GORDIAN KNOT")
 
     removed = False
 
@@ -511,13 +664,25 @@ def cmd_uninstall(args, source_dir: Path) -> bool:
     systemctl_user("daemon-reload")
 
     if not removed:
-        log_warn("No installed files found")
+        log_warn("No DEMIURGE / GORDIAN KNOT files found")
     else:
-        log_info("Uninstall complete")
+        log_info("DEMIURGE WM + GORDIAN KNOT uninstalled")
 
     if INSTALL_CONFIG_DIR.exists():
         log_info(f"Config directory preserved: {INSTALL_CONFIG_DIR}")
 
+    if do_abraxas:
+        phase("ABRAXAS color-temperature daemon")
+        if not delegate_uninstall(source_dir / "ABRAXAS" / "install.py"):
+            log_warn("ABRAXAS uninstall reported issues; see PHASE log above")
+
+    if do_cherrypie:
+        phase("cherrypie window-matching daemon")
+        if not delegate_uninstall(source_dir / "cherrypie" / "install.py"):
+            log_warn("cherrypie uninstall reported issues; see PHASE log above")
+
+    print()
+    log_info("Uninstall complete")
     return True
 
 
@@ -606,6 +771,20 @@ Examples:
                        help="Command to run (default: install)")
     parser.add_argument("-y", "--yes", action="store_true",
                        help="Assume yes to prompts (non-interactive installs)")
+
+    # Per-component flags. Each pair is mutex; absence = prompt
+    # interactively. -y treats absence as yes.
+    abraxas_grp = parser.add_mutually_exclusive_group()
+    abraxas_grp.add_argument("--abraxas", action="store_true",
+                             help="Install ABRAXAS (no prompt)")
+    abraxas_grp.add_argument("--no-abraxas", action="store_true",
+                             help="Skip ABRAXAS (no prompt)")
+
+    cherrypie_grp = parser.add_mutually_exclusive_group()
+    cherrypie_grp.add_argument("--cherrypie", action="store_true",
+                               help="Install cherrypie (no prompt)")
+    cherrypie_grp.add_argument("--no-cherrypie", action="store_true",
+                               help="Skip cherrypie (no prompt)")
 
     args = parser.parse_args()
     source_dir = Path(__file__).parent.resolve()

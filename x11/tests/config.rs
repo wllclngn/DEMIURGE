@@ -344,3 +344,152 @@ tag = "X"
     let err = parse_config(toml).unwrap_err();
     assert!(err.contains("cmd must not be empty"));
 }
+
+#[test]
+fn input_keyboard_repeat_defaults_to_zero() {
+    let toml = r##"[general]
+tags = ["X"]
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert_eq!(cfg.input.keyboard.repeat_delay, 0);
+    assert_eq!(cfg.input.keyboard.repeat_rate, 0);
+    assert_eq!(cfg.input.keyboard.layout, "");
+    assert_eq!(cfg.input.keyboard.variant, "");
+    assert!(cfg.input.keyboard.options.is_empty());
+}
+
+#[test]
+fn input_keyboard_full_block_parses() {
+    let toml = r##"[general]
+tags = ["X"]
+
+[input.keyboard]
+repeat_delay = 185
+repeat_rate = 30
+layout = "us"
+variant = "dvorak"
+options = ["caps:escape", "ctrl:nocaps"]
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert_eq!(cfg.input.keyboard.repeat_delay, 185);
+    assert_eq!(cfg.input.keyboard.repeat_rate, 30);
+    assert_eq!(cfg.input.keyboard.layout, "us");
+    assert_eq!(cfg.input.keyboard.variant, "dvorak");
+    assert_eq!(
+        cfg.input.keyboard.options,
+        vec!["caps:escape".to_string(), "ctrl:nocaps".to_string()]
+    );
+}
+
+#[test]
+fn input_idle_defaults_to_zero() {
+    let toml = r##"[general]
+tags = ["X"]
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert_eq!(cfg.input.idle.lock_seconds, 0);
+    assert_eq!(cfg.input.idle.screensaver_seconds, 0);
+    assert_eq!(cfg.input.idle.dpms_standby_seconds, 0);
+    assert_eq!(cfg.input.idle.dpms_suspend_seconds, 0);
+    assert_eq!(cfg.input.idle.dpms_off_seconds, 0);
+}
+
+#[test]
+fn input_idle_full_block_parses() {
+    let toml = r##"[general]
+tags = ["X"]
+
+[input.idle]
+lock_seconds = 600
+screensaver_seconds = 300
+dpms_standby_seconds = 300
+dpms_suspend_seconds = 600
+dpms_off_seconds = 900
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert_eq!(cfg.input.idle.lock_seconds, 600);
+    assert_eq!(cfg.input.idle.screensaver_seconds, 300);
+    assert_eq!(cfg.input.idle.dpms_standby_seconds, 300);
+    assert_eq!(cfg.input.idle.dpms_suspend_seconds, 600);
+    assert_eq!(cfg.input.idle.dpms_off_seconds, 900);
+}
+
+#[test]
+fn input_bell_all_none_when_omitted() {
+    let toml = r##"[general]
+tags = ["X"]
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert!(cfg.input.bell.enabled.is_none());
+    assert!(cfg.input.bell.volume.is_none());
+    assert!(cfg.input.bell.pitch_hz.is_none());
+    assert!(cfg.input.bell.duration_ms.is_none());
+}
+
+#[test]
+fn input_bell_disable_sets_enabled_some_false() {
+    let toml = r##"[general]
+tags = ["X"]
+
+[input.bell]
+enabled = false
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert_eq!(cfg.input.bell.enabled, Some(false));
+}
+
+#[test]
+fn cursor_auto_hide_defaults() {
+    let toml = r##"[general]
+tags = ["X"]
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert!(!cfg.cursor.auto_hide);
+    assert_eq!(cfg.cursor.auto_hide_seconds, 5);
+}
+
+#[test]
+fn cursor_auto_hide_explicit() {
+    let toml = r##"[general]
+tags = ["X"]
+
+[cursor]
+auto_hide = true
+auto_hide_seconds = 0
+"##;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, toml).unwrap();
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert!(cfg.cursor.auto_hide);
+    assert_eq!(cfg.cursor.auto_hide_seconds, 0);
+}

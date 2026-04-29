@@ -8,11 +8,22 @@ Target: rustc 1.85+ (Rust 2024 edition). Linux only. X11 only.
 
 ## Components
 
+DEMIURGE is a Cargo workspace. The window manager itself lives in
+`x11/` and `wayland/` with shared logic in `core/`. Two adjacent
+daemons that complete the desktop also live here:
+
 | Binary / module | Role |
 |---|---|
 | `demiurge` | Window manager. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar, tag-targeted startup spawns, session-scoped child teardown on quit. |
+| `demiurge-wl` | Wayland implementation (smithay-based, currently winit dev backend). DSR via offscreen-render + downscale; the rest of the WM features port from `x11/` over the v0.8+ slices. |
 | `gordian_knot` | Screen locker + idle daemon + lock-on-suspend hook. Setuid-root with seccomp-bpf + landlock sandbox. PAM authentication via inline FFI. |
-| `torrentius` | Rendering subsystem (not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by both binaries. |
+| `torrentius` | Rendering subsystem (in `core/`, not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by `demiurge`, `gordian_knot`, eventually `demiurge-wl`. |
+| `abraxas` | Color-temperature daemon. Solar grayline (Jean Meeus algorithms) + sigmoid transitions, NOAA cloud-cover weather awareness, four gamma backends (Wayland wlr-gamma, GNOME D-Bus, DRM ioctl, X11 RandR). io_uring event loop. C23 and Rust implementations side-by-side; pick at install time. Replaces redshift. |
+| `cherrypie` | Window-matching daemon. TOML rules + regex over WM_CLASS / title / role / process / type. Hot-reload, RandR-aware multi-monitor placement. Replaces devilspie / devilspie2. |
+
+All five binaries share the same workspace version. abraxas and
+cherrypie were independent projects before being absorbed; they now
+ship under DEMIURGE's release cadence.
 
 ## Build
 
@@ -116,20 +127,141 @@ and `[cursor] size` as `XCURSOR_SIZE` at WM init so every spawned child
 inherits. `demiurge --setup` writes the equivalent GTK + icon defaults
 files.
 
+`[cursor] auto_hide` is the unclutter replacement: when true, the cursor
+hides after `auto_hide_seconds` of no pointer motion and reappears the
+moment you move the mouse. `auto_hide_seconds = 0` with `auto_hide =
+true` gives "always hidden except while actively moving" — keyboard-
+forward extreme. The auto-hide is force-suspended during a Super+drag
+operation so the cursor stays visible while you're dragging a window.
+Hot-reloadable along with the rest of the config; toggling
+`auto_hide = false` immediately force-shows.
+
 | Key | Type | Default |
 |---|---|---|
 | `cursor.theme` | `String` | `"default"` |
 | `cursor.size` | `u32` | `24` |
+| `cursor.auto_hide` | `bool` | `false` |
+| `cursor.auto_hide_seconds` | `u32` | `5` |
 | `font.default` | `String` | `"Noto Sans 9"` |
+
+### `[input]`
+
+Settings DEMIURGE owns directly. The point: external tools (`xset`,
+`setxkbmap`) get clobbered by X server resets, MappingNotify echoes,
+USB keyboard hot-plug, etc., so a one-shot startup command silently
+becomes wrong over the course of a session. Putting these in the
+config means DEMIURGE re-applies them on every event that would
+otherwise reset them, and pulls the surface into one place that
+hot-reloads with the rest of the config.
+
+#### `[input.keyboard]`
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `repeat_delay` | `u32` ms | `0` | Milliseconds before auto-repeat starts. xset r rate's first arg. `0` means "leave server default in place" — DEMIURGE doesn't touch the setting. |
+| `repeat_rate` | `u32` per sec | `0` | Repeats per second after the delay. xset r rate's second arg. `0` means "leave server default". |
+| `layout` | `String` | `""` | XKB layout (e.g. `"us"`, `"us,de"`). Empty = leave default. |
+| `variant` | `String` | `""` | XKB variant (e.g. `"dvorak"`, `"colemak"`). |
+| `options` | `[String]` | `[]` | XKB options pass-through. Common values: `"caps:escape"`, `"ctrl:nocaps"`, `"compose:menu"`, `"altwin:swap_lalt_lwin"`. List is the full set; existing options are cleared before applying. |
+
+If `repeat_delay` or `repeat_rate` is non-zero, DEMIURGE applies the
+values via XKB SetControls at startup, re-applies on every
+MappingNotify event (USB hot-plug, layout switch, external
+setxkbmap), and re-applies on config hot-reload.
+
+If any of `layout` / `variant` / `options` is non-empty, DEMIURGE
+applies the layout via XKB at startup and re-applies on hot-reload.
+Implementation note: the X server takes RMLVO via xkbcomp's rules
+parser; DEMIURGE invokes `setxkbmap` internally to push the values
+(setxkbmap is part of the standard X11 stack). Replaces
+`setxkbmap -layout … -option …` from startup.commands.
+
+#### `[input.idle]`
+
+Single source of truth for "when does the session go dark"
+thresholds. GORDIAN KNOT's idle daemon reads `lock_seconds` from
+here; DEMIURGE's session applies the DPMS and screensaver timeouts
+to the X server.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `lock_seconds` | `u32` | `0` | Idle threshold for GORDIAN KNOT to fire the locker. `0` falls back to legacy `gordian_knot.idle_timeout_seconds` (default 600). Setting this here is the new path. |
+| `screensaver_seconds` | `u32` | `0` | X11 SetScreenSaver timeout. `0` = leave default. |
+| `dpms_standby_seconds` | `u32` | `0` | DPMS standby timer (monitor low-power). |
+| `dpms_suspend_seconds` | `u32` | `0` | DPMS suspend timer (deeper low-power). |
+| `dpms_off_seconds` | `u32` | `0` | DPMS off timer (monitor fully off). |
+
+DPMS is enabled when any of the three timers is non-zero; if all are
+zero, DEMIURGE leaves DPMS state alone (does not enable, does not
+disable). The three timer fields can be set independently — fields
+left at `0` retain whatever the X server currently has for that
+slot.
+
+#### `[input.bell]`
+
+X11 audible bell. Most keyboard-forward setups want this off
+permanently; this is the place to do it once.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | `Option<bool>` | unset | `false` silences (volume forced to 0). `true` enables; combine with `volume` for level. Unset = leave default. |
+| `volume` | `Option<u8>` | unset | 0–100. Server clamps. |
+| `pitch_hz` | `Option<u16>` | unset | Bell pitch in Hz. |
+| `duration_ms` | `Option<u16>` | unset | Bell duration in milliseconds. |
+
+Applied via `ChangeKeyboardControl`. The four fields use `Option`
+because "explicitly opted out" is meaningfully different from "left
+the default in place" — TOML omitting the field means the latter.
+
+### `[[display]]`
+
+Per-output mode + Dynamic Super Resolution (DSR) + DPI ownership.
+Each entry matches one output by connector name (or EDID model
+substring); first match wins. Outputs not matching any entry keep
+their server-default state.
+
+```toml
+[[display]]
+match = "DP-1"           # output connector name or EDID substring
+mode = "2560x1440"       # native panel mode
+dsr_multiplier = 2.0     # render at 5120x2880, downscale to 2560x1440
+dpi = 138
+filter = "bilinear"      # X11: "bilinear" | "nearest"
+                         # Wayland: "bilinear" (default), Lanczos shader follow-on
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `match` | `String` | required | Connector name (`"DP-1"`, `"HDMI-A-0"`) or EDID model substring (case-insensitive). |
+| `mode` | `String` | `""` | Panel mode (`"WIDTHxHEIGHT"`). Empty = leave current mode. |
+| `dsr_multiplier` | `f64` | `1.0` | Framebuffer is rendered at this multiple of the panel size and downscaled for scanout. `2.0` = render 4× the pixels. |
+| `dpi` | `u32` | `0` | X server reported DPI. `0` = leave default. Subsumes `xrandr --dpi`. |
+| `filter` | `String` | `"bilinear"` | Downscale filter. X11 only honors bilinear/nearest; Wayland defaults bilinear with Lanczos as a future quality option. |
+
+**X11 implementation:** Applied via RandR's CRTC transform matrix
+(internally invokes `xrandr` from inside DEMIURGE). The driver's
+scanout pipe does the GPU-side downscale; the wire signal stays at
+native bandwidth. Replaces `xrandr -s`, `xrandr --scale`, and
+`xrandr --dpi` lines from startup.commands.
+
+**Wayland implementation:** Applied as a compositor-side render
+pass in demiurge-wl. Clients render into an offscreen GLES texture
+sized at `panel_size × dsr_multiplier`; a downscale pass blits that
+texture to the scanout target with bilinear sampling. Lower-quality
+filter than what's possible (Lanczos compute shader is a future
+upgrade; same TOML reaches it). Currently single-output via the
+winit dev backend; per-output matching mirrors the X11 path when
+the udev/DRM backend lands.
+
+**No `[[display]]` entry = no DSR.** Both implementations skip the
+pass entirely when `dsr_multiplier == 1.0`, so the cost when
+disabled is zero.
 
 ### `[startup]`
 
 ```toml
 [startup]
 commands = [
-    "xset r rate 185 30",
-    "xrandr -s 2560x1440",
-    "xrandr --dpi 138",
     "xrdb -merge ~/.Xresources",
 ]
 

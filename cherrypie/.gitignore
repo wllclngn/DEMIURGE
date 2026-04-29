@@ -1,0 +1,26 @@
+# Rust build artifacts
+target/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs, cores, temp
+*.log
+core
+*.core
+
+# Editor/OS noise
+*~
+*.swp
+*.swo
+\#*\#
+.#*
+
+# IDE
+.idea/
+.vscode/
+.cache/
+
+# Commit notes
+COMMIT_MESSAGE.txt

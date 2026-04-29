@@ -1,0 +1,32 @@
+[package]
+name = "abraxas"
+version.workspace = true
+edition = "2021"
+description = "Dynamic color temperature daemon with weather awareness"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[dependencies.wayland-client]
+version = "0.31"
+optional = true
+
+[dependencies.wayland-protocols-wlr]
+version = "0.3"
+features = ["client"]
+optional = true
+
+[dependencies.x11rb]
+version = "0.13"
+features = ["randr"]
+optional = true
+
+[features]
+default = ["noaa", "x11"]
+noaa = []
+wayland = ["wayland-client", "wayland-protocols-wlr"]
+x11 = ["x11rb"]
+gnome = []
+

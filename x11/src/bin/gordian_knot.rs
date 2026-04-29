@@ -197,7 +197,18 @@ fn main() -> ExitCode {
             // Path to our own binary so the daemon can respawn us for each
             // lock session. argv[0] is what the kernel was asked to exec.
             let self_bin = env::args().next().unwrap_or_else(|| "gordian_knot".into());
-            daemon::run(&cfg.gordian_knot, &self_bin)
+            // Resolve idle threshold: prefer the new [input.idle]
+            // lock_seconds (single source of truth for "when does
+            // the session go dark" thresholds). Fall back to the
+            // legacy [gordian_knot] idle_timeout_seconds if the new
+            // field is left at 0, so existing configs migrate without
+            // breaking.
+            let threshold = if cfg.input.idle.lock_seconds > 0 {
+                cfg.input.idle.lock_seconds as u64
+            } else {
+                cfg.gordian_knot.idle_timeout_seconds
+            };
+            daemon::run(threshold, &self_bin)
         }
         Mode::Auto => {
             if env::var_os("DISPLAY").is_some() {

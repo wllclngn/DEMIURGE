@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "abraxas"
+version = "0.7.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "wayland-client",
+ "wayland-protocols-wlr",
+ "x11rb",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,6 +416,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cherrypie"
+version = "0.7.0"
+dependencies = [
+ "libc",
+ "regex",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+ "x11rb",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,7 +519,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "demiurge-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cairo-rs",
  "pango",
@@ -506,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "demiurge-wl"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "calloop 0.14.4",
  "demiurge-core",
@@ -519,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "demiurge-x11"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "cairo-rs",
  "demiurge-core",
@@ -1753,6 +1777,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f450ad9c3b1da563fb6948a8e0fb0fb9269711c9c73d9ea1de5058c79c8d643a"
 dependencies = [
  "bitflags 2.11.0",
+]
+
+[[package]]
+name = "regex"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

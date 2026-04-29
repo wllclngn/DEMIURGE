@@ -25,4 +25,5 @@
 // its own follow-on slice.
 
 pub mod client;
+pub mod dsr;
 pub mod wm;

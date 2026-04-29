@@ -2,8 +2,11 @@ mod appearance;
 mod atoms;
 mod bar;
 mod config;
+mod cursor;
+mod display;
 mod event;
 mod ewmh;
+mod idle;
 mod keys;
 mod layout;
 mod monitor;
@@ -107,11 +110,24 @@ fn main() {
     // Setup inotify for config hot-reload
     let inotify_fd = setup_inotify(&paths.config_file);
 
+    // Setup cursor auto-hide timerfd (~100ms tick driving cursor::tick).
+    // Always created -- the tick is a no-op when [cursor] auto_hide
+    // is false, so the cost when disabled is one timerfd read every
+    // 100ms.
+    let cursor_fd = cursor::setup_timerfd();
+
     // Event loop
-    run(&mut wm, signal_fd, timer_fd, inotify_fd, &paths.config_file);
+    run(
+        &mut wm,
+        signal_fd,
+        timer_fd,
+        inotify_fd,
+        cursor_fd,
+        &paths.config_file,
+    );
 
     // Cleanup
-    cleanup(&wm, timer_fd, inotify_fd);
+    cleanup(&wm, timer_fd, inotify_fd, cursor_fd);
     eprintln!("[demiurge] exiting");
 }
 
@@ -270,11 +286,12 @@ fn run(
     signal_fd: i32,
     timer_fd: i32,
     inotify_fd: i32,
+    cursor_fd: i32,
     config_path: &std::path::Path,
 ) {
     let x11_fd = wm.connection_fd();
 
-    // poll() ignores entries with fd < 0, so always pass all 4
+    // poll() ignores entries with fd < 0, so always pass all 5
     let mut fds = [
         libc::pollfd {
             fd: x11_fd,
@@ -284,6 +301,7 @@ fn run(
         poll_events(signal_fd),
         poll_events(timer_fd),
         poll_events(inotify_fd),
+        poll_events(cursor_fd),
     ];
     let nfds = fds.len() as libc::nfds_t;
 
@@ -378,6 +396,14 @@ fn run(
             }
         }
 
+        // Cursor auto-hide tick (~100ms cadence). Polls pointer
+        // position via XQueryPointer and shows/hides via XFixes.
+        // No-op when [cursor] auto_hide is false.
+        if fds[4].revents & libc::POLLIN != 0 {
+            cursor::drain_timerfd(cursor_fd);
+            wm.cursor_tick();
+        }
+
         // Config file changed: hot-reload
         if fds[3].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 1024];
@@ -399,7 +425,7 @@ fn run(
     }
 }
 
-fn cleanup(wm: &wm::Wm, timer_fd: i32, inotify_fd: i32) {
+fn cleanup(wm: &wm::Wm, timer_fd: i32, inotify_fd: i32, cursor_fd: i32) {
     // Tear down the session's children before dropping the X connection,
     // so terminals, music players, and tag-pinned helpers (montauk) exit
     // alongside the WM instead of being reparented to init.
@@ -421,6 +447,9 @@ fn cleanup(wm: &wm::Wm, timer_fd: i32, inotify_fd: i32) {
         }
         if inotify_fd >= 0 {
             libc::close(inotify_fd);
+        }
+        if cursor_fd >= 0 {
+            libc::close(cursor_fd);
         }
     }
 }

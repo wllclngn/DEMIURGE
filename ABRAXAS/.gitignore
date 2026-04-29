@@ -1,0 +1,49 @@
+# C23 build artifacts
+c23/build/
+c23/abraxas
+c23/libmeridian/build*/
+c23/libmeridian/libmeridian.so
+c23/libmeridian/libmeridian.a
+
+# Rust build artifacts
+rust/target/
+
+# Compile artifacts
+*.o
+*.so
+*.d
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Images
+*.png
+*.PNG
+
+# Logs, cores, temp
+*.log
+*.out
+core
+*.core
+
+# Editor/OS noise
+*~
+*.swp
+*.swo
+\#*\#
+.#*
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+.cache/
+.clangd/
+.ccls-cache/
+compile_commands.json
+
+# Commit notes
+COMMIT_MESSAGE.txt

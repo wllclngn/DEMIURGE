@@ -1,0 +1,11 @@
+[Unit]
+Description=cherrypie window matching daemon
+
+[Service]
+Environment=DISPLAY=:0
+ExecStart=%h/.local/bin/cherrypie
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

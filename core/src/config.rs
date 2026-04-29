@@ -34,6 +34,10 @@ pub struct Config {
     pub cursor: Cursor,
     #[serde(default)]
     pub font: Font,
+    #[serde(default)]
+    pub input: Input,
+    #[serde(default, rename = "display")]
+    pub displays: Vec<Display>,
     #[serde(default, rename = "keybind")]
     pub keybinds: Vec<Keybind>,
     // Used by the GORDIAN KNOT binary, not DEMIURGE itself. Dead-code
@@ -41,6 +45,30 @@ pub struct Config {
     #[allow(dead_code)]
     #[serde(default)]
     pub gordian_knot: GordianKnot,
+}
+
+// Per-output display configuration. Each entry matches an output by
+// connector name (e.g., "DP-1", "HDMI-A-0") or EDID model substring.
+// First match wins; outputs with no matching entry keep their server-
+// default mode and no DSR.
+//
+// Dynamic Super Resolution (DSR) -- the per-output dsr_multiplier --
+// renders the framebuffer at a higher resolution than the panel and
+// downscales for scanout. On X11, applied via RandR's CRTC transform
+// matrix (driver-side scaler). On Wayland, applied via a render-
+// target multiplier in demiurge-wl with a downscale pass before
+// scanout. Same TOML reaches both implementations.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Display {
+    pub r#match: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default = "default_dsr_multiplier")]
+    pub dsr_multiplier: f64,
+    #[serde(default)]
+    pub dpi: u32,
+    #[serde(default = "default_dsr_filter")]
+    pub filter: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +200,16 @@ pub struct Cursor {
     pub theme: String,
     #[serde(default = "default_cursor_size")]
     pub size: u32,
+    // When true, the cursor hides after auto_hide_seconds of no
+    // pointer motion and reappears on motion. Default false: normal
+    // cursor behavior. Setting auto_hide_seconds = 0 with auto_hide
+    // = true gives "always hidden except while moving" -- the cursor
+    // is gone the moment you stop, visible only during active
+    // movement. Force-shown during a Super+drag operation.
+    #[serde(default)]
+    pub auto_hide: bool,
+    #[serde(default = "default_cursor_auto_hide_seconds")]
+    pub auto_hide_seconds: u32,
 }
 
 impl Default for Cursor {
@@ -179,6 +217,137 @@ impl Default for Cursor {
         Self {
             theme: default_cursor_theme(),
             size: default_cursor_size(),
+            auto_hide: false,
+            auto_hide_seconds: default_cursor_auto_hide_seconds(),
+        }
+    }
+}
+
+// Settings DEMIURGE owns directly (replaces external xset / setxkbmap
+// dependencies in startup.commands). Each field maps 1:1 to an X11
+// protocol call applied at Wm::init and re-applied on the events
+// that would otherwise clobber it (MappingNotify for keyboard,
+// reload_config for everything else).
+#[derive(Debug, Default, Deserialize)]
+pub struct Input {
+    #[serde(default)]
+    pub keyboard: InputKeyboard,
+    #[serde(default)]
+    pub idle: Idle,
+    #[serde(default)]
+    pub bell: Bell,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputKeyboard {
+    // Milliseconds to wait before auto-repeat starts. xset r rate's
+    // first arg. 0 disables (the X server uses its compiled default).
+    #[serde(default)]
+    pub repeat_delay: u32,
+    // Auto-repeat rate in repeats per second. xset r rate's second
+    // arg. 0 disables.
+    #[serde(default)]
+    pub repeat_rate: u32,
+    // XKB Rules-Model-Layout-Variant-Options. Empty string / empty
+    // vec = "leave server default in place" (DEMIURGE doesn't own
+    // the layout). When non-empty, applied via XKB
+    // GetKeyboardByName at Wm::init and reload_config -- the server
+    // compiles internally; no shellout to setxkbmap or xkbcomp.
+    //
+    // layout: ISO 639 code or compound ("us", "us,de", "fr").
+    // variant: optional sub-layout ("dvorak", "colemak").
+    // options: ["caps:escape", "ctrl:nocaps", "compose:menu"]. List
+    // is pass-through; typos surface as the X server falling back
+    // to the previous keymap (visible at next keystroke).
+    #[serde(default)]
+    pub layout: String,
+    #[serde(default)]
+    pub variant: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+impl Default for InputKeyboard {
+    fn default() -> Self {
+        Self {
+            repeat_delay: 0,
+            repeat_rate: 0,
+            layout: String::new(),
+            variant: String::new(),
+            options: Vec::new(),
+        }
+    }
+}
+
+// Idle / power-save / lock thresholds. Single source of truth for the
+// "when does the session go dark" timeline -- DEMIURGE applies DPMS
+// timeouts to the X server, the X screensaver timeout, and GORDIAN
+// KNOT's daemon reads lock_seconds from here too.
+//
+// All values in seconds. 0 means "leave the server default in place"
+// (DEMIURGE doesn't own that timer). Tier ordering during a session:
+//   screensaver_seconds <= dpms_standby_seconds <=
+//   dpms_suspend_seconds <= dpms_off_seconds, then
+//   lock_seconds independently triggers GORDIAN KNOT.
+//
+// We don't enforce ordering -- the X server will accept any values,
+// and a user can set lock < dpms or vice versa depending on their
+// preference (lock-before-blank vs. blank-before-lock).
+#[derive(Debug, Deserialize)]
+pub struct Idle {
+    #[serde(default)]
+    pub lock_seconds: u32,
+    #[serde(default)]
+    pub screensaver_seconds: u32,
+    #[serde(default)]
+    pub dpms_standby_seconds: u32,
+    #[serde(default)]
+    pub dpms_suspend_seconds: u32,
+    #[serde(default)]
+    pub dpms_off_seconds: u32,
+}
+
+impl Default for Idle {
+    fn default() -> Self {
+        Self {
+            lock_seconds: 0,
+            screensaver_seconds: 0,
+            dpms_standby_seconds: 0,
+            dpms_suspend_seconds: 0,
+            dpms_off_seconds: 0,
+        }
+    }
+}
+
+// X11 audible bell. xset b's surface. enabled = false silences the
+// terminal BEL on most setups; the alternative is each app that emits
+// BEL handling it themselves, which most don't.
+#[derive(Debug, Deserialize)]
+pub struct Bell {
+    // None = leave server default in place. Some(true) = on,
+    // Some(false) = silence. We use Option rather than a bool with
+    // a default because "the user explicitly didn't configure this"
+    // is meaningfully different from "the user wants the default".
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    // Volume 0-100; X server clamps. None = don't touch.
+    #[serde(default)]
+    pub volume: Option<u8>,
+    // Pitch in Hz. None = don't touch.
+    #[serde(default)]
+    pub pitch_hz: Option<u16>,
+    // Duration in milliseconds. None = don't touch.
+    #[serde(default)]
+    pub duration_ms: Option<u16>,
+}
+
+impl Default for Bell {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            volume: None,
+            pitch_hz: None,
+            duration_ms: None,
         }
     }
 }
@@ -252,6 +421,15 @@ fn default_cursor_theme() -> String {
 }
 fn default_cursor_size() -> u32 {
     24
+}
+fn default_cursor_auto_hide_seconds() -> u32 {
+    5
+}
+fn default_dsr_multiplier() -> f64 {
+    1.0
+}
+fn default_dsr_filter() -> String {
+    "bilinear".into()
 }
 fn default_font_family() -> String {
     "Noto Sans 9".into()

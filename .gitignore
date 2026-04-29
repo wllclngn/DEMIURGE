@@ -1,3 +1,31 @@
+# Cargo workspace target. The build dir is overridden to
+# /tmp/demiurge-build/ at the convention level (see global
+# CLAUDE.md), but this catches the default if anyone forgets.
 /target
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Editor / OS cruft
+*~
+*.swp
+*.swo
+\#*\#
+.#*
+.DS_Store
+
+# IDE caches at workspace root. Per-subproject IDE noise is
+# handled by ABRAXAS/.gitignore and cherrypie/.gitignore.
+.idea/
+.vscode/
+.cache/
+.clangd/
+.ccls-cache/
+compile_commands.json
+
+# Runtime debris
+*.log
+core
+*.core
