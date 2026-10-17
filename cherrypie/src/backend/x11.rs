@@ -3,11 +3,12 @@ use std::os::fd::AsRawFd;
 use x11rb::atom_manager;
 use x11rb::connection::Connection;
 use x11rb::properties::WmClass;
-use x11rb::protocol::randr::ConnectionExt as RandrExt;
+use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use super::UnmatchedWindow;
 use crate::rules::{
     CompiledRule, DimensionVal, MonitorTarget, NamedPosition, PositionTarget, SizeTarget,
 };
@@ -43,11 +44,13 @@ atom_manager! {
         _NET_WM_WINDOW_TYPE_SPLASH,
         _NET_WM_WINDOW_OPACITY,
         _NET_ACTIVE_WINDOW,
+        _NET_WORKAREA,
+        _NET_CURRENT_DESKTOP,
         _MOTIF_WM_HINTS,
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorGeometry {
     pub name: String,
     pub x: i32,
@@ -60,7 +63,7 @@ pub struct X11Backend {
     conn: RustConnection,
     root: Window,
     atoms: Atoms,
-    monitors: Vec<MonitorGeometry>,
+    monitors: std::cell::RefCell<Vec<MonitorGeometry>>,
     known_clients: std::cell::RefCell<Vec<Window>>,
     handled: std::cell::RefCell<Vec<Window>>,
     pending_startup: std::cell::RefCell<Vec<Window>>,
@@ -116,25 +119,40 @@ impl X11Backend {
             .reply()
             .map_err(|e| format!("intern atoms reply: {}", e))?;
 
+        // Follow mode changes and hot-plug, so placement tracks the monitors
+        // as they are now rather than as they were at startup.
+        // RandR requires the version announced before any other request,
+        // and one full probe: The Current form used below reports only what
+        // the server already holds, which is nothing on a server that builds
+        // its outputs lazily.
+        conn.randr_query_version(1, 6)
+            .map_err(|e| format!("randr query version: {}", e))?
+            .reply()
+            .map_err(|e| format!("randr query version: {}", e))?;
+        conn.randr_get_screen_resources(root)
+            .map_err(|e| format!("randr probe: {}", e))?
+            .reply()
+            .map_err(|e| format!("randr probe: {}", e))?;
+        let mask = NotifyMask::SCREEN_CHANGE | NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_CHANGE;
+        conn.randr_select_input(root, mask)
+            .map_err(|e| format!("randr select input: {}", e))?
+            .check()
+            .map_err(|e| format!("randr select input: {}", e))?;
+
         let monitors = query_monitors(&conn, root)?;
 
         let initial_clients = get_client_list(&conn, root, &atoms);
 
         conn.flush().map_err(|e| format!("flush: {}", e))?;
 
-        for (i, mon) in monitors.iter().enumerate() {
-            eprintln!(
-                "[x11] monitor {}: '{}' {}x{}+{}+{}",
-                i, mon.name, mon.width, mon.height, mon.x, mon.y
-            );
-        }
+        log_monitors(&monitors);
         eprintln!("[x11] found {} existing windows", initial_clients.len());
 
         Ok(Self {
             conn,
             root,
             atoms,
-            monitors,
+            monitors: std::cell::RefCell::new(monitors),
             known_clients: std::cell::RefCell::new(initial_clients.clone()),
             handled: std::cell::RefCell::new(Vec::new()),
             pending_startup: std::cell::RefCell::new(initial_clients),
@@ -145,15 +163,16 @@ impl X11Backend {
         self.conn.stream().as_raw_fd()
     }
 
-    pub fn process_events(&self, rules: &[CompiledRule], dry_run: bool) {
+    pub fn process_events(&self, rules: &[CompiledRule], dry_run: bool) -> Vec<UnmatchedWindow> {
         let mut need_flush = false;
+        let mut unmatched = Vec::new();
 
         // Apply rules to windows that existed at startup
         let startup = self.pending_startup.take();
         if !startup.is_empty() {
             let mut handled = self.handled.borrow_mut();
             for window in startup {
-                self.handle_new_window(window, rules, dry_run);
+                unmatched.extend(self.handle_new_window(window, rules, dry_run));
                 handled.push(window);
                 need_flush = true;
             }
@@ -165,14 +184,27 @@ impl X11Backend {
         // queue while poll() sees no socket data and never wakes us.
         loop {
             let mut client_list_changed = false;
+            let mut monitors_changed = false;
 
             while let Some(event) = self.conn.poll_for_event().ok().flatten() {
-                if let x11rb::protocol::Event::PropertyNotify(ev) = event
-                    && ev.window == self.root
-                    && ev.atom == self.atoms._NET_CLIENT_LIST
-                {
-                    client_list_changed = true;
+                match event {
+                    x11rb::protocol::Event::PropertyNotify(ev)
+                        if ev.window == self.root && ev.atom == self.atoms._NET_CLIENT_LIST =>
+                    {
+                        client_list_changed = true;
+                    }
+                    x11rb::protocol::Event::RandrScreenChangeNotify(_)
+                    | x11rb::protocol::Event::RandrNotify(_) => monitors_changed = true,
+                    _ => {}
                 }
+            }
+
+            if monitors_changed
+                && let Ok(monitors) = query_monitors(&self.conn, self.root)
+                && *self.monitors.borrow() != monitors
+            {
+                log_monitors(&monitors);
+                *self.monitors.borrow_mut() = monitors;
             }
 
             if !client_list_changed {
@@ -185,7 +217,7 @@ impl X11Backend {
 
             for &window in &current {
                 if !known.contains(&window) && !handled.contains(&window) {
-                    self.handle_new_window(window, rules, dry_run);
+                    unmatched.extend(self.handle_new_window(window, rules, dry_run));
                     handled.push(window);
                     need_flush = true;
                 }
@@ -199,17 +231,30 @@ impl X11Backend {
         if need_flush {
             let _ = self.conn.flush();
         }
+        unmatched
     }
 
-    fn handle_new_window(&self, window: Window, rules: &[CompiledRule], dry_run: bool) {
+    pub fn apply(&self, window: Window, rule: &CompiledRule) {
+        self.apply_rule(window, rule);
+        let _ = self.conn.flush();
+    }
+
+    fn handle_new_window(
+        &self,
+        window: Window,
+        rules: &[CompiledRule],
+        dry_run: bool,
+    ) -> Option<UnmatchedWindow> {
         let class = self.get_class(window);
         let title = self.get_title(window);
         let role = self.get_role(window);
         let process = self.get_process_name(window);
         let window_type = self.get_window_type(window);
+        let mut matched = false;
 
         for rule in rules {
             if rule.matches(&class, &title, &role, &process, &window_type) {
+                matched = true;
                 let now = local_time();
                 eprintln!(
                     "[{}] [INFO]   matched '{}' (class='{}', title='{}', process='{}')",
@@ -223,6 +268,91 @@ impl X11Backend {
                 }
             }
         }
+
+        // EWMH: A managed window with WM_TRANSIENT_FOR and no type is a
+        // dialog, whatever get_window_type defaulted it to. A fullscreen
+        // window (a game) keeps its own geometry, and an untitled one is a
+        // helper, not an application to remember.
+        if matched
+            || class.is_empty()
+            || title.is_empty()
+            || window_type != "normal"
+            || self.is_transient(window)
+            || self.is_fullscreen(window)
+        {
+            return None;
+        }
+        Some(UnmatchedWindow { window, class, title, role, process, window_type })
+    }
+
+    pub fn client_alive(&self, window: Window) -> bool {
+        get_client_list(&self.conn, self.root, &self.atoms).contains(&window)
+    }
+
+    // Fullscreen by state, or by exactly covering a monitor (games often
+    // size themselves to the output without setting the state).
+    fn is_fullscreen(&self, window: Window) -> bool {
+        let by_state = self
+            .conn
+            .get_property(false, window, self.atoms._NET_WM_STATE, AtomEnum::ATOM, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|mut v| v.any(|a| a == self.atoms._NET_WM_STATE_FULLSCREEN)))
+            .unwrap_or(false);
+        by_state
+            || self.get_window_geometry(window).is_some_and(|(x, y, w, h)| {
+                self.monitors
+                    .borrow()
+                    .iter()
+                    .any(|m| (m.x, m.y, m.width, m.height) == (x, y, w, h))
+            })
+    }
+
+    // The part of `monitor` inside the WM's work area for the current
+    // desktop (_NET_WORKAREA): The monitor less the bar under DEMIURGE. The
+    // whole monitor when the WM publishes no work area.
+    fn work_area(&self, monitor: &MonitorGeometry) -> MonitorGeometry {
+        let desktop = self
+            .conn
+            .get_property(false, self.root, self.atoms._NET_CURRENT_DESKTOP, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().and_then(|mut v| v.next()))
+            .unwrap_or(0) as usize;
+        let area: Vec<u32> = self
+            .conn
+            .get_property(false, self.root, self.atoms._NET_WORKAREA, AtomEnum::CARDINAL, 0, 1024)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default();
+        let Some(rect) = area.get(desktop * 4..desktop * 4 + 4).or_else(|| area.get(0..4)) else {
+            return monitor.clone();
+        };
+        let (ax, ay) = (rect[0] as i32, rect[1] as i32);
+        let (ax2, ay2) = (ax + rect[2] as i32, ay + rect[3] as i32);
+        let x = monitor.x.max(ax);
+        let y = monitor.y.max(ay);
+        let x2 = (monitor.x + monitor.width as i32).min(ax2);
+        let y2 = (monitor.y + monitor.height as i32).min(ay2);
+        if x2 <= x || y2 <= y {
+            return monitor.clone();
+        }
+        MonitorGeometry {
+            name: monitor.name.clone(),
+            x,
+            y,
+            width: (x2 - x) as u32,
+            height: (y2 - y) as u32,
+        }
+    }
+
+    fn is_transient(&self, window: Window) -> bool {
+        self.conn
+            .get_property(false, window, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.value.len() >= 4)
     }
 
     // PROPERTY GETTERS
@@ -364,10 +494,17 @@ impl X11Backend {
     // ACTION APPLICATION
 
     fn apply_rule(&self, window: Window, rule: &CompiledRule) {
-        let target_monitor = self.resolve_monitor(window, rule);
+        let target_monitor = self.work_area(&self.resolve_monitor(window, rule));
+        // A fullscreen window keeps the geometry it chose; every other
+        // action still applies.
+        let place = !self.is_fullscreen(window);
 
         // Size first (position may depend on resolved size for centering)
-        let resolved_size = rule.size.as_ref().map(|sz| self.resolve_size(sz, &target_monitor));
+        let resolved_size = rule
+            .size
+            .as_ref()
+            .filter(|_| place)
+            .map(|sz| self.resolve_size(sz, &target_monitor));
 
         if let Some((w, h)) = resolved_size {
             let _ = self.conn.configure_window(
@@ -376,7 +513,7 @@ impl X11Backend {
             );
         }
 
-        if let Some(ref pos) = rule.position {
+        if let Some(ref pos) = rule.position.as_ref().filter(|_| place) {
             let win_size = resolved_size.or_else(|| {
                 self.get_window_geometry(window).map(|(_, _, w, h)| (w, h))
             });
@@ -469,12 +606,12 @@ impl X11Backend {
         if let Some(ref target) = rule.monitor {
             match target {
                 MonitorTarget::Index(idx) => {
-                    if let Some(mon) = self.monitors.get(*idx as usize) {
+                    if let Some(mon) = self.monitors.borrow().get(*idx as usize) {
                         return mon.clone();
                     }
                 }
                 MonitorTarget::Name(name) => {
-                    if let Some(mon) = self.monitors.iter().find(|m| m.name == *name) {
+                    if let Some(mon) = self.monitors.borrow().iter().find(|m| m.name == *name) {
                         return mon.clone();
                     }
                     // Also try matching against EWMH desktop names / awesomewm tags
@@ -487,7 +624,7 @@ impl X11Backend {
         if let Some(geo) = self.get_window_geometry(window) {
             let cx = geo.0 + geo.2 as i32 / 2;
             let cy = geo.1 + geo.3 as i32 / 2;
-            for mon in &self.monitors {
+            for mon in self.monitors.borrow().iter() {
                 if cx >= mon.x
                     && cx < mon.x + mon.width as i32
                     && cy >= mon.y
@@ -499,6 +636,7 @@ impl X11Backend {
         }
 
         self.monitors
+            .borrow()
             .first()
             .cloned()
             .unwrap_or(MonitorGeometry {
@@ -646,6 +784,15 @@ impl X11Backend {
 
 // MONITOR QUERY
 
+fn log_monitors(monitors: &[MonitorGeometry]) {
+    for (i, mon) in monitors.iter().enumerate() {
+        eprintln!(
+            "[x11] monitor {}: '{}' {}x{}+{}+{}",
+            i, mon.name, mon.width, mon.height, mon.x, mon.y
+        );
+    }
+}
+
 fn query_monitors(conn: &RustConnection, root: Window) -> Result<Vec<MonitorGeometry>, String> {
     let resources = conn
         .randr_get_screen_resources_current(root)
@@ -723,7 +870,8 @@ fn get_client_list(conn: &RustConnection, root: Window, atoms: &Atoms) -> Vec<Wi
 fn resolve_dim(val: DimensionVal, total: i32) -> i32 {
     match val {
         DimensionVal::Pixels(px) => px,
-        DimensionVal::Percent(pct) => (total as f64 * pct) as i32,
+        // Round, not truncate: 70% of 720 is 503.999... in f64.
+        DimensionVal::Percent(pct) => (total as f64 * pct).round() as i32,
     }
 }
 

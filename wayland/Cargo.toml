@@ -11,6 +11,14 @@ path = "src/lib.rs"
 name = "demiurge-wl"
 path = "src/main.rs"
 
+# Real-session TTY entry point. Uses smithay's libseat / udev /
+# libinput / drm stack instead of the winit dev backend that powers
+# the demiurge-wl binary above. greetd's start_session command points
+# here once Wayland goes daily-driver.
+[[bin]]
+name = "demiurge-wl-tty"
+path = "src/bin/demiurge-wl-tty.rs"
+
 [dependencies]
 demiurge-core = { path = "../core" }
 # Smithay scaffolding. default-features = false avoids pulling in the
@@ -21,6 +29,23 @@ smithay = { version = "0.7", default-features = false, features = [
     "wayland_frontend",
     "desktop",
     "renderer_gl",
+    # Pulls in smithay's XWayland helper + xwayland-shell protocol.
+    # Required so x11 clients can connect to the session via the
+    # Xwayland binary spawned on demand by demiurge-wl.
+    "xwayland",
+    # Real-session backend stack. Used by the demiurge-wl-tty binary
+    # to run as a session compositor on a free TTY (vs the nested
+    # winit dev backend used by the demiurge-wl binary). libseat
+    # provides VT acquisition + drmSetMaster; udev enumerates DRM
+    # nodes and input devices; libinput converts evdev to compositor
+    # input; backend_drm + backend_egl + backend_gbm program the GPU.
+    "backend_drm",
+    "backend_gbm",
+    "backend_egl",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session_libseat",
+    "use_system_lib",
 ] }
 # Match smithay's transitive pins so the workspace resolves to a single
 # version of each.
@@ -29,3 +54,19 @@ wayland-protocols = { version = "0.32", features = ["server"] }
 calloop = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Bar rendering. Same versions x11/Cargo.toml uses so the workspace
+# resolves to a single cairo / pango / pangocairo build.
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+pango = "0.20"
+libc = "0.2"
+
+[dev-dependencies]
+# Test harness drives demiurge-wl as a Wayland client. wayland-client
+# is the client-side counterpart to wayland-server (same crate family).
+# wayland-protocols' `client` feature exposes xdg-shell on the client
+# side -- test code creates xdg_toplevel surfaces against demiurge-wl.
+# `staging` opens up ext-session-lock-v1 for the lock-cycle test.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+tempfile = "3"

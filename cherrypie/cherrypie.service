@@ -6,6 +6,7 @@ Environment=DISPLAY=:0
 ExecStart=%h/.local/bin/cherrypie
 Restart=always
 RestartSec=5
+RestartPreventExitStatus=0 78
 
 [Install]
 WantedBy=default.target

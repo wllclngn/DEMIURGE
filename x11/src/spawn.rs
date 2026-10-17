@@ -69,7 +69,7 @@ unsafe fn make_attr() -> libc::posix_spawnattr_t {
 // for correct interpretation (env expansion, quoting, redirects, pipes, globs).
 // Whitespace alone is not a metacharacter -- simple multi-arg commands like
 // "brightnessctl set 5%+" still take the fast direct-exec path.
-fn needs_shell(cmd: &str) -> bool {
+pub fn needs_shell(cmd: &str) -> bool {
     cmd.contains(|c: char| matches!(c,
         '$' | '`' | '"' | '\'' | '\\' | '~' | '*' | '?'
         | '[' | ']' | '{' | '}' | '(' | ')' | '|' | '&'
@@ -170,55 +170,5 @@ fn spawn_direct(cmd: &str) {
         } else {
             track(pid);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::needs_shell;
-
-    #[test]
-    fn simple_command_direct() {
-        assert!(!needs_shell("kitty"));
-        assert!(!needs_shell("physlock"));
-    }
-
-    #[test]
-    fn multi_arg_no_metachars_direct() {
-        assert!(!needs_shell("brightnessctl set 5%+"));
-        assert!(!needs_shell("brightnessctl set 5%-"));
-        assert!(!needs_shell("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+"));
-        assert!(!needs_shell("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"));
-    }
-
-    #[test]
-    fn dollar_var_needs_shell() {
-        assert!(needs_shell("flameshot gui -p $HOME"));
-        assert!(needs_shell("flameshot full -p $HOME"));
-    }
-
-    #[test]
-    fn pipe_needs_shell() {
-        assert!(needs_shell("echo hello | grep o"));
-    }
-
-    #[test]
-    fn redirect_needs_shell() {
-        assert!(needs_shell("echo hi > /tmp/out"));
-    }
-
-    #[test]
-    fn tilde_needs_shell() {
-        assert!(needs_shell("kitty -d ~"));
-    }
-
-    #[test]
-    fn glob_needs_shell() {
-        assert!(needs_shell("rm /tmp/foo*"));
-    }
-
-    #[test]
-    fn semicolon_needs_shell() {
-        assert!(needs_shell("a ; b"));
     }
 }

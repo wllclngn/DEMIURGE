@@ -15,6 +15,17 @@ pub struct WindowManager {
     backend: Backend,
 }
 
+// A normal, non-transient, titled, windowed (not fullscreen) window with a
+// class that no rule matched: The daemon's candidate for a learned rule.
+pub struct UnmatchedWindow {
+    pub window: u32,
+    pub class: String,
+    pub title: String,
+    pub role: String,
+    pub process: String,
+    pub window_type: String,
+}
+
 impl WindowManager {
     pub fn init(signal_fd: i32) -> Result<Self, String> {
         // X11
@@ -47,10 +58,24 @@ impl WindowManager {
         }
     }
 
-    pub fn process_events(&self, rules: &[CompiledRule], dry_run: bool) {
+    pub fn process_events(&self, rules: &[CompiledRule], dry_run: bool) -> Vec<UnmatchedWindow> {
         match &self.backend {
             #[cfg(feature = "x11")]
             Backend::X11(b) => b.process_events(rules, dry_run),
+        }
+    }
+
+    pub fn client_alive(&self, window: u32) -> bool {
+        match &self.backend {
+            #[cfg(feature = "x11")]
+            Backend::X11(b) => b.client_alive(window),
+        }
+    }
+
+    pub fn apply(&self, window: u32, rule: &CompiledRule) {
+        match &self.backend {
+            #[cfg(feature = "x11")]
+            Backend::X11(b) => b.apply(window, rule),
         }
     }
 }

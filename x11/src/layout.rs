@@ -8,6 +8,26 @@ use x11rb::protocol::xproto::*;
 use crate::wm::Wm;
 pub use demiurge_core::Layout;
 
+// Default placement for a floating window that asked for no position of
+// its own: Its size clamped to the work area, centered in it.
+pub fn center_in_work_area(
+    work_x: i32,
+    work_y: i32,
+    work_w: u32,
+    work_h: u32,
+    w: u32,
+    h: u32,
+) -> (i32, i32, u32, u32) {
+    let w = w.clamp(1, work_w.max(1));
+    let h = h.clamp(1, work_h.max(1));
+    (
+        work_x + (work_w.saturating_sub(w) / 2) as i32,
+        work_y + (work_h.saturating_sub(h) / 2) as i32,
+        w,
+        h,
+    )
+}
+
 impl Wm {
     // Cycle the layout for the focused monitor's active tag. Layouts
     // remain keyed on tag (not monitor-tag) -- a tag has at most one

@@ -13,6 +13,25 @@ use x11rb::rust_connection::RustConnection;
 
 pub use demiurge_core::monitor::{Monitor, Monitors};
 
+// Announce the RandR version this client speaks (the protocol requires it
+// before any other RandR request), then probe the outputs once.
+// GetScreenResourcesCurrent, which every later query uses, reports only
+// what the server already holds and never probes; a server that builds its
+// output and CRTC objects lazily (Xephyr) would otherwise report no outputs
+// until some other client probed, and the startup monitor list fell back
+// to the core screen.
+pub fn negotiate(conn: &RustConnection, root: Window) -> Result<(), String> {
+    conn.randr_query_version(1, 6)
+        .map_err(|e| format!("randr_query_version: {}", e))?
+        .reply()
+        .map_err(|e| format!("randr_query_version reply: {}", e))?;
+    conn.randr_get_screen_resources(root)
+        .map_err(|e| format!("randr_get_screen_resources: {}", e))?
+        .reply()
+        .map_err(|e| format!("randr_get_screen_resources reply: {}", e))?;
+    Ok(())
+}
+
 // Subscribe to RandR notifications on the root. SCREEN_CHANGE fires on
 // `xrandr -s` resolution changes; CRTC/OUTPUT_CHANGE catch hot-plug and
 // per-output mode swaps. Server-side cost is negligible -- one bit set
@@ -84,4 +103,35 @@ fn query_randr(conn: &RustConnection, root: Window) -> Result<Vec<Monitor>, Stri
     }
 
     Ok(monitors)
+}
+
+// Every connected, active output with its current, preferred and
+// advertised modes, for modes::ModeTracker.
+pub fn query_outputs(conn: &RustConnection, root: Window) -> Vec<crate::modes::OutputMode> {
+    let Ok(resources) = conn
+        .randr_get_screen_resources_current(root)
+        .map_err(|e| e.to_string())
+        .and_then(|c| c.reply().map_err(|e| e.to_string()))
+    else {
+        return Vec::new();
+    };
+    let mut outputs = Vec::new();
+    for &output_id in &resources.outputs {
+        let Some(info) = conn.randr_get_output_info(output_id, 0).ok().and_then(|c| c.reply().ok()) else {
+            continue;
+        };
+        if info.crtc == 0 || info.connection != x11rb::protocol::randr::Connection::CONNECTED {
+            continue;
+        }
+        let Some(crtc) = conn.randr_get_crtc_info(info.crtc, 0).ok().and_then(|c| c.reply().ok()) else {
+            continue;
+        };
+        outputs.push(crate::modes::OutputMode {
+            name: String::from_utf8_lossy(&info.name).to_string(),
+            mode: crtc.mode,
+            preferred: (info.num_preferred > 0).then(|| info.modes.first().copied()).flatten(),
+            modes: info.modes,
+        });
+    }
+    outputs
 }

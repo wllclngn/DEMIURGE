@@ -344,10 +344,17 @@ fn type_alone_is_valid_matcher() {
 }
 
 #[test]
-fn reject_missing_file() {
+fn missing_file_loads_empty() {
     let paths = config::Paths::with_config(PathBuf::from("/tmp/cherrypie-nonexistent.toml"));
-    let err = config::load(&paths).unwrap_err();
-    assert!(!err.is_empty());
+    let cfg = config::load(&paths).unwrap();
+    assert!(cfg.rule.is_empty());
+}
+
+#[test]
+fn file_without_rules_loads_empty() {
+    let (_dir, paths) = temp_config("# no rules yet\n");
+    let cfg = config::load(&paths).unwrap();
+    assert!(cfg.rule.is_empty());
 }
 
 #[test]

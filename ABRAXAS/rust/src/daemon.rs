@@ -124,7 +124,7 @@ fn setup_signalfd() -> i32 {
 /// Parse inotify event buffer, returning flag bits for changed files.
 fn parse_inotify_events(buf: &[u8], paths: &Paths) -> u32 {
     let override_name = paths.override_file.file_name().and_then(|n| n.to_str()).unwrap_or("override.json");
-    let config_name = paths.config_file.file_name().and_then(|n| n.to_str()).unwrap_or("config.ini");
+    let config_name = paths.config_file.file_name().and_then(|n| n.to_str()).unwrap_or("config.toml");
 
     const EVENT_HEADER_SIZE: usize = 16;
     let mut offset = 0;
@@ -639,12 +639,15 @@ fn tick(state: &mut DaemonState, override_changed: bool, config_changed: bool) {
 
     // Reload config if inotify detected a config file change
     if config_changed {
-        if let Some(new_loc) = config::load_location(&state.paths) {
-            state.location = new_loc;
-            eprintln!(
-                "[config] Location updated: {:.4}, {:.4}",
-                state.location.lat, state.location.lon
-            );
+        match config::load_location(&state.paths) {
+            Ok(new_loc) => {
+                state.location = new_loc;
+                eprintln!(
+                    "[config] Location updated: {:.4}, {:.4}",
+                    state.location.lat, state.location.lon
+                );
+            }
+            Err(e) => eprintln!("[config] keeping current location: {}", e),
         }
         state.weather = config::load_weather_cache(&state.paths);
     }

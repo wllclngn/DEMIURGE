@@ -1,162 +1,173 @@
-// X11 in-session lock.
+// X11 in-session lock: The holder.
 //
-// Stays inside the graphical session. Grabs keyboard + pointer, maps a
-// fullscreen override-redirect window over the desktop, renders the SYSTEM
-// and USER panels via torrentius, reads keystrokes, authenticates via PAM.
-// On success: unmap + ungrab + return 0. On grab failure: return Err so the
-// dispatcher can fall back to the VT path.
+// Runs as root (real uid 0, so the user's processes cannot signal it),
+// never draws and never loads a font. It owns the fullscreen
+// override-redirect lock window and the keyboard + pointer grab, decodes
+// keys with xkbcommon into the mlocked Secret, and runs PAM in a forked
+// child per attempt. Drawing is the UI child's (ui.rs): Unprivileged,
+// sandboxed, told only how many characters were typed.
 //
-// Limitations flagged upfront:
-//   - No monitor-aware centering; panels are centered on the root-window
-//     bounding box. On multi-monitor setups they land between the monitors.
-//   - Clock ticks once per second; the event loop wakes every 1000ms
-//     regardless of activity.
-//   - Pointer hiding is best-effort; the grab with no-op cursor usually
-//     suffices but some drivers still flash the cursor for a frame.
+// Order is the point:
+//   1. connect, create + map the lock window
+//   2. key decoder and password buffer ready
+//   3. spawn the UI child and wait for "painted" (its first frame accepted)
+//   4. only then take the grab
+// A locker that cannot show its prompt never holds input. Anything that
+// fails before the grab is LockError::Unavailable, and the dispatcher may
+// fall back to the VT lock; once the grab is held there is no fallback.
+//
+// A UI child that dies leaves the grab held and the window mapped; the
+// holder respawns it (at most once a second). A PAM module that crashes
+// costs one attempt, not the lock.
+//
+// Limitation of any X11 in-session lock: Other clients can watch XInput2
+// raw key events while the grab is held. The VT lock gives X no input.
 
-use std::os::fd::AsRawFd;
-use std::time::Instant;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
+
 use crate::config::GordianKnot as Cfg;
-use crate::gordian_knot::pam::{self, AuthError};
-use crate::gordian_knot::sysinfo;
-use crate::keys::{self, KeyMap};
-use crate::torrentius::{self, PanelColors, PanelRow};
+use crate::gordian_knot::keyinput::{Decoder, KeyAction};
+use crate::gordian_knot::privsep::{self, Ident};
+use crate::gordian_knot::secret::Secret;
+use crate::gordian_knot::{pam, ui};
+use crate::torrentius;
+
+const PAINT_TIMEOUT: Duration = Duration::from_secs(10);
+const RESPAWN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub enum LockError {
-    Connect(String),
-    GrabFailed,
-    Runtime(String),
+    // Nothing was locked; a fallback is safe.
+    Unavailable(String),
+    // The lock was up and failed.
+    Failed(String),
 }
 
 impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LockError::Connect(s) => write!(f, "X11 connect: {}", s),
-            LockError::GrabFailed => write!(f, "keyboard/pointer grab failed"),
-            LockError::Runtime(s) => write!(f, "x11 runtime: {}", s),
+            LockError::Unavailable(s) => write!(f, "X11 lock unavailable: {}", s),
+            LockError::Failed(s) => write!(f, "X11 lock failed: {}", s),
         }
     }
 }
 
-// Entry point. Returns Ok(()) when the user authenticates. Returns
-// LockError::GrabFailed if the grab never takes -- dispatcher should fall
-// back to the VT path.
-pub fn lock(cfg: &Cfg, user: &str) -> Result<(), LockError> {
+pub fn lock(cfg: &Cfg, ident: &Ident, sandbox: bool) -> Result<(), LockError> {
+    let unavailable = |e: String| LockError::Unavailable(e);
     let (conn, screen_num) =
-        RustConnection::connect(None).map_err(|e| LockError::Connect(e.to_string()))?;
+        RustConnection::connect(None).map_err(|e| unavailable(format!("connect: {}", e)))?;
     let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
-    let depth = screen.root_depth;
-    let w = screen.width_in_pixels as u32;
-    let h = screen.height_in_pixels as u32;
+    let (root, depth) = (screen.root, screen.root_depth);
+    let (w, h) = (screen.width_in_pixels, screen.height_in_pixels);
 
-    let win = conn
-        .generate_id()
-        .map_err(|e| LockError::Runtime(format!("generate_id: {}", e)))?;
-    let gc = conn
-        .generate_id()
-        .map_err(|e| LockError::Runtime(format!("generate_id: {}", e)))?;
-
-    let bg_pixel = torrentius::hex_to_pixel(&cfg.bg);
-
+    let win = conn.generate_id().map_err(|e| unavailable(e.to_string()))?;
     conn.create_window(
         depth,
         win,
         root,
         0,
         0,
-        w as u16,
-        h as u16,
+        w,
+        h,
         0,
         WindowClass::INPUT_OUTPUT,
         0,
         &CreateWindowAux::new()
             .override_redirect(1)
-            .background_pixel(bg_pixel)
+            .background_pixel(torrentius::hex_to_pixel(&cfg.bg))
             .event_mask(
                 EventMask::KEY_PRESS
-                    | EventMask::EXPOSURE
-                    | EventMask::STRUCTURE_NOTIFY,
+                    | EventMask::STRUCTURE_NOTIFY
+                    // Re-raise if another client maps over the lock: X11
+                    // cannot prevent a cover, only answer it at once.
+                    | EventMask::VISIBILITY_CHANGE,
             ),
     )
-    .map_err(|e| LockError::Runtime(format!("create_window: {}", e)))?;
-
-    conn.create_gc(gc, win, &CreateGCAux::new())
-        .map_err(|e| LockError::Runtime(format!("create_gc: {}", e)))?;
-
+    .map_err(|e| unavailable(format!("create_window: {}", e)))?;
+    let destroy = |conn: &RustConnection| {
+        let _ = conn.destroy_window(win);
+        let _ = conn.flush();
+    };
     let _ = conn.map_window(win);
     let _ = conn.configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
     let _ = conn.flush();
 
-    // Grab keyboard + pointer, retry a few times if another client is
-    // holding a grab (happens when another lock is just releasing).
-    if !grab_input(&conn, win) {
-        let _ = conn.destroy_window(win);
-        let _ = conn.flush();
-        return Err(LockError::GrabFailed);
+    let Some(decoder) = Decoder::from_server(&conn, root) else {
+        destroy(&conn);
+        return Err(unavailable("no XKB keymap for this server".into()));
+    };
+    let secret = match Secret::new() {
+        Ok(s) => s,
+        Err(e) => {
+            destroy(&conn);
+            return Err(unavailable(format!("password buffer: {}", e)));
+        }
+    };
+
+    let mut ui = match UiChild::spawn(ident, win, sandbox) {
+        Ok(u) => u,
+        Err(e) => {
+            destroy(&conn);
+            return Err(unavailable(e));
+        }
+    };
+    if !ui.wait_painted(PAINT_TIMEOUT) {
+        ui.stop();
+        destroy(&conn);
+        return Err(unavailable("the lock screen never painted".into()));
     }
+    if !grab_input(&conn, win) {
+        ui.stop();
+        destroy(&conn);
+        return Err(unavailable("keyboard/pointer grab failed".into()));
+    }
+    privsep::signal_ready();
 
-    let keymap = keys::load_keymap(&conn);
+    let result = event_loop(&conn, win, root, decoder, secret, &mut ui, ident);
 
-    // PAM conversation runs synchronously on Enter; draw loop otherwise.
-    let result = event_loop(&conn, win, gc, w, h, depth, cfg, user, &keymap);
-
-    // Cleanup: ungrab, unmap, destroy, disconnect.
     let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
     let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
-    let _ = conn.unmap_window(win);
-    let _ = conn.destroy_window(win);
-    let _ = conn.flush();
-
+    ui.stop();
+    destroy(&conn);
     result
 }
 
 fn grab_input(conn: &RustConnection, win: Window) -> bool {
-    for attempt in 0..50 {
-        let kb = conn.grab_keyboard(
-            false,
-            win,
-            x11rb::CURRENT_TIME,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        );
-        let kb_ok = kb
+    // 50 tries x 100 ms: Enough to outlast another client releasing a grab.
+    for _ in 0..50 {
+        let kb = conn
+            .grab_keyboard(false, win, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)
             .ok()
             .and_then(|c| c.reply().ok())
-            .map(|r| r.status == GrabStatus::SUCCESS)
-            .unwrap_or(false);
-
-        let ptr = conn.grab_pointer(
-            false,
-            win,
-            EventMask::NO_EVENT,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            x11rb::NONE,
-            x11rb::CURRENT_TIME,
-        );
-        let ptr_ok = ptr
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| r.status == GrabStatus::SUCCESS)
-            .unwrap_or(false);
-
-        if kb_ok && ptr_ok {
+            .is_some_and(|r| r.status == GrabStatus::SUCCESS);
+        let ptr = kb
+            && conn
+                .grab_pointer(
+                    false,
+                    win,
+                    EventMask::NO_EVENT,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                    x11rb::NONE,
+                    x11rb::NONE,
+                    x11rb::CURRENT_TIME,
+                )
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some_and(|r| r.status == GrabStatus::SUCCESS);
+        if kb && ptr {
             return true;
         }
-
-        // Back off and retry.
-        unsafe {
-            let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 };
-            libc::nanosleep(&ts, std::ptr::null_mut());
+        if kb {
+            let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
         }
-        let _ = attempt;
+        std::thread::sleep(Duration::from_millis(100));
     }
     false
 }
@@ -164,260 +175,227 @@ fn grab_input(conn: &RustConnection, win: Window) -> bool {
 fn event_loop(
     conn: &RustConnection,
     win: Window,
-    gc: Gcontext,
-    w: u32,
-    h: u32,
-    depth: u8,
-    cfg: &Cfg,
-    user: &str,
-    keymap: &KeyMap,
+    root: Window,
+    mut decoder: Decoder,
+    mut secret: Secret,
+    ui: &mut UiChild,
+    ident: &Ident,
 ) -> Result<(), LockError> {
-    let mut state = UiState {
-        password: String::new(),
-        message: String::new(),
-        last_tick: Instant::now(),
-    };
-
-    redraw(conn, win, gc, w, h, depth, cfg, user, &state)
-        .map_err(|e| LockError::Runtime(e))?;
-
-    let fd = conn.stream().as_raw_fd();
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let failed = |e: String| LockError::Failed(e);
+    let mut status = String::new();
+    ui.send(secret.char_count(), false, &status);
 
     loop {
-        // Drain queued events.
-        loop {
-            match conn.poll_for_event() {
-                Ok(Some(ev)) => {
-                    if let Some(outcome) = handle_event(ev, cfg, user, keymap, &mut state) {
-                        match outcome {
-                            LoopOutcome::Authenticated => return Ok(()),
-                            LoopOutcome::Redraw => {
-                                redraw(conn, win, gc, w, h, depth, cfg, user, &state)
-                                    .map_err(|e| LockError::Runtime(e))?;
+        while let Some(ev) = conn.poll_for_event().map_err(|e| failed(e.to_string()))? {
+            match ev {
+                Event::KeyPress(kp) => {
+                    match decoder.decode(&kp) {
+                        KeyAction::Submit if secret.is_empty() => {
+                            status = "Type your password and press Enter.".into();
+                        }
+                        KeyAction::Submit => {
+                            ui.send(secret.char_count(), true, "");
+                            let attempt = pam::authenticate_forked(&ident.name, &mut secret);
+                            secret.clear();
+                            for m in &attempt.messages {
+                                eprintln!("[gordian_knot] pam: {}", m);
+                            }
+                            match attempt.result {
+                                Ok(()) => return Ok(()),
+                                Err(e) => {
+                                    eprintln!("[gordian_knot] attempt failed: {}", e);
+                                    status = attempt.messages.last().cloned().unwrap_or_else(|| e.to_string());
+                                }
+                            }
+                            discard_queued_events(conn, win)?;
+                        }
+                        KeyAction::Backspace => secret.pop_char(),
+                        KeyAction::Clear => {
+                            secret.clear();
+                            status.clear();
+                        }
+                        KeyAction::Append(s) => {
+                            if !secret.push(s.as_bytes()) {
+                                status = "Password too long.".into();
                             }
                         }
+                        KeyAction::Ignore => continue,
+                    }
+                    ui.send(secret.char_count(), false, &status);
+                }
+                Event::VisibilityNotify(v) if v.state != Visibility::UNOBSCURED => {
+                    let _ = conn.configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+                }
+                Event::MappingNotify(_) => {
+                    if let Some(d) = Decoder::from_server(conn, root) {
+                        decoder = d;
                     }
                 }
-                Ok(None) => break,
-                Err(e) => return Err(LockError::Runtime(e.to_string())),
+                _ => {}
             }
         }
         let _ = conn.flush();
 
-        // 1s timeout so the clock ticks.
-        pfd.revents = 0;
-        let ret = unsafe { libc::poll(&mut pfd, 1, 1000) };
-        if ret < 0 {
-            continue;
+        if ui.supervise() {
+            ui.send(secret.char_count(), false, &status);
         }
-        if state.last_tick.elapsed().as_secs() >= 1 {
-            state.last_tick = Instant::now();
-            redraw(conn, win, gc, w, h, depth, cfg, user, &state)
-                .map_err(|e| LockError::Runtime(e))?;
-        }
+
+        let mut fds = [
+            libc::pollfd { fd: conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: ui.sock(), events: libc::POLLIN, revents: 0 },
+        ];
+        unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
     }
 }
 
-struct UiState {
-    password: String,
-    message: String,
-    last_tick: Instant,
-}
-
-enum LoopOutcome {
-    Authenticated,
-    Redraw,
-}
-
-fn handle_event(
-    ev: Event,
-    cfg: &Cfg,
-    user: &str,
-    keymap: &KeyMap,
-    state: &mut UiState,
-) -> Option<LoopOutcome> {
-    match ev {
-        Event::KeyPress(kp) => on_key_press(kp, cfg, user, keymap, state),
-        Event::Expose(ex) if ex.count == 0 => Some(LoopOutcome::Redraw),
-        _ => None,
-    }
-}
-
-fn on_key_press(
-    ev: KeyPressEvent,
-    _cfg: &Cfg,
-    user: &str,
-    keymap: &KeyMap,
-    state: &mut UiState,
-) -> Option<LoopOutcome> {
-    let shift = u16::from(ev.state) & u16::from(ModMask::SHIFT) != 0;
-    let keysym = keycode_to_keysym(ev.detail, shift, keymap);
-    match keysym {
-        0xff0d | 0xff8d => {
-            // Return / KP_Enter -- submit. Gate empty passwords: the PAM
-            // stack's pam_faildelay stalls 2-3s per attempt and pam_faillock
-            // trips the account after a few failures. If the user hammers
-            // Enter on an empty buffer after a wrong attempt (which clears
-            // state.password below), we'd submit "" repeatedly and lock
-            // them out of their own account until the faillock window
-            // expires. Silently drop empty-Enter instead.
-            if state.password.is_empty() {
-                state.message = "Type your password and press Enter.".to_string();
-                return Some(LoopOutcome::Redraw);
-            }
-            state.message.clear();
-            match pam::authenticate(user, &state.password) {
-                Ok(()) => Some(LoopOutcome::Authenticated),
-                Err(AuthError::WrongCredentials) => {
-                    state.message = "Authentication failed".to_string();
-                    state.password.clear();
-                    Some(LoopOutcome::Redraw)
-                }
-                Err(e) => {
-                    state.message = format!("{}", e);
-                    state.password.clear();
-                    Some(LoopOutcome::Redraw)
-                }
-            }
-        }
-        0xff08 => {
-            // BackSpace
-            state.password.pop();
-            Some(LoopOutcome::Redraw)
-        }
-        0xff1b => {
-            // Escape: clear entered password, do not exit the lock.
-            state.password.clear();
-            state.message.clear();
-            Some(LoopOutcome::Redraw)
-        }
-        0x0015 => {
-            // Ctrl+U (in some layouts). Clear line.
-            state.password.clear();
-            Some(LoopOutcome::Redraw)
-        }
-        sym if (0x20..=0x7e).contains(&sym) => {
-            state.password.push(sym as u8 as char);
-            Some(LoopOutcome::Redraw)
-        }
-        _ => None,
-    }
-}
-
-fn keycode_to_keysym(keycode: u8, shift: bool, keymap: &KeyMap) -> u32 {
-    if keycode < keymap.min_keycode {
-        return 0;
-    }
-    let base = (keycode - keymap.min_keycode) as usize * keymap.syms_per_code;
-    let idx = base + if shift && keymap.syms_per_code > 1 { 1 } else { 0 };
-    keymap.keysyms.get(idx).copied().unwrap_or(0)
-}
-
-fn redraw(
-    conn: &RustConnection,
-    win: Window,
-    gc: Gcontext,
-    w: u32,
-    h: u32,
-    depth: u8,
-    cfg: &Cfg,
-    user: &str,
-    state: &UiState,
-) -> Result<(), String> {
-    let (surface, cr) = torrentius::new_surface(w as i32, h as i32)?;
-    let font_opts = torrentius::make_font_options()?;
-    cr.set_font_options(&font_opts);
-
-    let (br, bg, bb) = torrentius::parse_hex(&cfg.bg);
-    cr.set_source_rgb(br, bg, bb);
-    let _ = cr.paint();
-
-    let font_desc = pango::FontDescription::from_string(&cfg.font);
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.set_font_description(Some(&font_desc));
-    let pango_ctx = layout.context();
-    pangocairo::functions::context_set_font_options(&pango_ctx, Some(&font_opts));
-
-    let colors = PanelColors {
-        bg: torrentius::parse_hex(&cfg.bg),
-        fg: torrentius::parse_hex(&cfg.fg),
-        accent: torrentius::parse_hex(&cfg.accent),
-        border: torrentius::parse_hex(&cfg.fg),
-    };
-
-    let sys_hostname = sysinfo::hostname();
-    let sys_kernel = sysinfo::kernel_release();
-    let sys_date = sysinfo::current_date();
-    let sys_time = sysinfo::current_time();
-    let sys_uptime = sysinfo::uptime_formatted();
-
-    let sys_rows = [
-        PanelRow { label: "HOSTNAME", value: &sys_hostname },
-        PanelRow { label: "KERNEL", value: &sys_kernel },
-        PanelRow { label: "DATE", value: &sys_date },
-        PanelRow { label: "TIME", value: &sys_time },
-        PanelRow { label: "UPTIME", value: &sys_uptime },
-    ];
-
-    let dots: String = std::iter::repeat('\u{25cf}')
-        .take(state.password.chars().count())
-        .collect();
-    let user_rows = [
-        PanelRow { label: "USER", value: user },
-        PanelRow { label: &cfg.prompt, value: &dots },
-    ];
-
-    let panel_w: f64 = 520.0;
-    let sys_h = torrentius::panel_height_for(&layout, sys_rows.len());
-    let user_h = torrentius::panel_height_for(&layout, user_rows.len());
-    let stack_h = sys_h + 24.0 + user_h;
-    let x0 = (w as f64 - panel_w) / 2.0;
-    let y0 = (h as f64 - stack_h) / 2.0;
-
-    torrentius::draw_panel(
-        &cr, &layout, x0, y0, panel_w, sys_h, "SYSTEM", &sys_rows, &colors,
-    );
-    torrentius::draw_panel(
-        &cr,
-        &layout,
-        x0,
-        y0 + sys_h + 24.0,
-        panel_w,
-        user_h,
-        "USER",
-        &user_rows,
-        &colors,
-    );
-
-    if !state.message.is_empty() {
-        let (fr, fg, fb) = torrentius::parse_hex(&cfg.accent);
-        cr.set_source_rgb(fr, fg, fb);
-        layout.set_text(&state.message);
-        let (mw, _) = layout.pixel_size();
-        let mx = (w as f64 - mw as f64) / 2.0;
-        let my = y0 + stack_h + 16.0;
-        cr.move_to(mx, my);
-        pangocairo::functions::show_layout(&cr, &layout);
-    }
-
-    drop(cr);
-    surface.flush();
-
-    let _ = surface.with_data(|data| {
-        let _ = conn.put_image(
-            ImageFormat::Z_PIXMAP,
-            win,
-            gc,
-            w as u16,
-            h as u16,
-            0,
-            0,
-            0,
-            depth,
-            data,
-        );
-    });
-    let _ = conn.flush();
+// Keys typed while PAM was deciding were typed blind: Drop everything the
+// server queued meanwhile (sync() pulls it all in), then re-raise, since a
+// VisibilityNotify among the dropped events would otherwise go unanswered.
+fn discard_queued_events(conn: &RustConnection, win: Window) -> Result<(), LockError> {
+    conn.sync().map_err(|e| LockError::Failed(e.to_string()))?;
+    while conn.poll_for_event().map_err(|e| LockError::Failed(e.to_string()))?.is_some() {}
+    let _ = conn.configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
     Ok(())
+}
+
+struct UiChild {
+    exe: std::ffi::CString,
+    ident: Ident,
+    win: Window,
+    sandbox: bool,
+    pid: i32,
+    sock: OwnedFd,
+    spawned_at: Instant,
+}
+
+impl UiChild {
+    fn spawn(ident: &Ident, win: Window, sandbox: bool) -> Result<UiChild, String> {
+        // Resolved here, as root: The child is non-dumpable after its
+        // setuid change, so its own /proc/self/exe is not readable to it.
+        let exe = std::fs::read_link("/proc/self/exe").map_err(|e| format!("/proc/self/exe: {}", e))?;
+        let exe = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        let (pid, sock) = start(&exe, ident, win, sandbox)?;
+        Ok(UiChild { exe, ident: ident.clone(), win, sandbox, pid, sock, spawned_at: Instant::now() })
+    }
+
+    fn sock(&self) -> RawFd {
+        self.sock.as_raw_fd()
+    }
+
+    fn wait_painted(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            let mut pfd = libc::pollfd { fd: self.sock(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as i32) } <= 0 {
+                return false;
+            }
+            let mut b = 0u8;
+            let n = unsafe { libc::recv(self.sock(), &mut b as *mut u8 as *mut libc::c_void, 1, 0) };
+            if n <= 0 {
+                return false;
+            }
+            if b == b'P' {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn send(&self, dots: usize, busy: bool, status: &str) {
+        let msg = ui::encode_state(dots, busy, status);
+        unsafe {
+            libc::send(
+                self.sock(),
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        };
+    }
+
+    // Reap a dead UI child and start another. True when a new one started
+    // (the caller resends the current state).
+    fn supervise(&mut self) -> bool {
+        let mut status = 0;
+        let gone = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } == self.pid;
+        if !gone || self.spawned_at.elapsed() < RESPAWN_INTERVAL {
+            return false;
+        }
+        eprintln!("[gordian_knot] UI child exited; the lock holds, restarting it");
+        match start(&self.exe, &self.ident, self.win, self.sandbox) {
+            Ok((pid, sock)) => {
+                self.pid = pid;
+                self.sock = sock;
+                self.spawned_at = Instant::now();
+                true
+            }
+            Err(e) => {
+                eprintln!("[gordian_knot] UI restart failed: {}", e);
+                self.spawned_at = Instant::now();
+                false
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        unsafe {
+            libc::kill(self.pid, libc::SIGTERM);
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+// Fork, drop to the user with NO_NEW_PRIVS, and re-exec this binary as the
+// UI (`--ui 3 WINDOW`) with the socket on fd 3 and nothing else inherited.
+fn start(exe: &std::ffi::CStr, ident: &Ident, win: Window, sandbox: bool) -> Result<(i32, OwnedFd), String> {
+    let mut sv = [0i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } != 0 {
+        return Err(format!("socketpair: {}", std::io::Error::last_os_error()));
+    }
+    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+
+    // Everything allocated before fork: The child only makes syscalls.
+    let win_arg = std::ffi::CString::new(win.to_string()).unwrap();
+    let mut argv: Vec<&std::ffi::CStr> = vec![c"gordian_knot", c"--ui", c"3", &win_arg];
+    if !sandbox {
+        argv.push(c"--no-sandbox");
+    }
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let oom = c"/proc/self/oom_score_adj";
+
+    match unsafe { libc::fork() } {
+        -1 => Err(format!("fork: {}", std::io::Error::last_os_error())),
+        0 => unsafe {
+            // The holder's -1000 is not the renderer's to keep.
+            let fd = libc::open(oom.as_ptr(), libc::O_WRONLY);
+            if fd >= 0 {
+                libc::write(fd, b"0".as_ptr() as *const libc::c_void, 1);
+                libc::close(fd);
+            }
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            // dup2 onto itself would keep CLOEXEC, so fd 3 is cleared directly.
+            let moved = if theirs.as_raw_fd() == 3 {
+                libc::fcntl(3, libc::F_SETFD, 0) == 0
+            } else {
+                libc::dup2(theirs.as_raw_fd(), 3) == 3
+            };
+            if !moved {
+                libc::_exit(126);
+            }
+            libc::syscall(libc::SYS_close_range, 4u32, u32::MAX, 0u32);
+            if libc::setresgid(ident.gid, ident.gid, ident.gid) != 0
+                || libc::setresuid(ident.uid, ident.uid, ident.uid) != 0
+                || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            {
+                libc::_exit(126);
+            }
+            libc::execv(exe.as_ptr(), argv_ptrs.as_ptr());
+            libc::_exit(127);
+        },
+        pid => {
+            drop(theirs);
+            Ok((pid, ours))
+        }
+    }
 }

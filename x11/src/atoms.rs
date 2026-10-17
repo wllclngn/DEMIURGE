@@ -39,6 +39,7 @@ atom_manager! {
         _NET_WM_STATE_BELOW,
         _NET_WM_STATE_HIDDEN,
         _NET_WM_STATE_STICKY,
+        _NET_WM_STATE_DEMANDS_ATTENTION,
         _NET_WM_ALLOWED_ACTIONS,
         _NET_WM_WINDOW_TYPE,
         _NET_WM_WINDOW_TYPE_NORMAL,

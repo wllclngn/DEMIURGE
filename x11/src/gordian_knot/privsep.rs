@@ -1,99 +1,127 @@
 // Privilege separation primitives.
 //
-// The VT locker runs setuid-root (it has to: VT_LOCKSWITCH is root-only).
-// But the PAM conversation and the input-reading UI should NOT run as root.
-// So the parent does VT ioctls, then forks a child that drops to the real
-// UID via setresgid/setresuid/PR_SET_NO_NEW_PRIVS before touching PAM.
+// The binary is setuid-root. Every mode decides its privilege first thing:
 //
-// PAM's shadow access is handled by pam_unix's setuid helper unix_chkpwd --
-// we don't need to be root for pam_authenticate to work. This is how every
-// non-root locker (i3lock, swaylock) handles PAM.
+//   lock holder (X11 / VT)  becomes root fully (real uid 0 too), so the
+//                           user's own processes cannot signal it; holds the
+//                           grab or the VT and runs PAM in forked children
+//   UI child                drops to the user, sets NO_NEW_PRIVS, re-execs,
+//                           then sandboxes itself after its first frame
+//   daemon, --wl, --login   drop to the user at once and stay there
 //
-// The child runs as the invoking user. Inherited fds (the TTY, the X11
-// socket) survive the privilege drop unchanged, so the child can still
-// read/write them. The parent waits on the child and handles VT cleanup
-// via the child's exit status.
+// NO_NEW_PRIVS is never set on a process that runs PAM: It makes the
+// kernel ignore unix_chkpwd's setuid bit, and every password then fails.
 
+use std::ffi::CStr;
 use std::io;
 
-// Drop from root to the invoking user's real UID/GID. Must be called only
-// in a fresh child process (after fork). Order matters: setresgid before
-// setresuid, because setresuid drops the capability to change groups.
-//
-// Also sets PR_SET_NO_NEW_PRIVS so the child can't regain privileges via a
-// subsequent setuid binary exec. (unix_chkpwd still works because PAM does
-// the setuid handoff at the kernel level, not through our exec.)
-pub fn drop_to_real_user() -> Result<(), String> {
-    unsafe {
-        let uid = libc::getuid();
-        let gid = libc::getgid();
+// The invoking user, captured before any credential change.
+#[derive(Clone)]
+pub struct Ident {
+    pub uid: libc::uid_t,
+    pub gid: libc::gid_t,
+    pub name: String,
+}
 
-        if libc::setresgid(gid, gid, gid) != 0 {
+pub fn invoking_user() -> Ident {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let pw = unsafe { libc::getpwuid(uid) };
+    let name = if pw.is_null() {
+        String::from("user")
+    } else {
+        unsafe { CStr::from_ptr((*pw).pw_name) }.to_string_lossy().into_owned()
+    };
+    Ident { uid, gid, name }
+}
+
+// Real, effective and saved ids all become the user's. Order matters:
+// setresgid before setresuid, which drops the right to change groups.
+pub fn drop_to_user(id: &Ident) -> Result<(), String> {
+    unsafe {
+        if libc::setresgid(id.gid, id.gid, id.gid) != 0 {
             return Err(format!("setresgid: {}", io::Error::last_os_error()));
         }
-        if libc::setresuid(uid, uid, uid) != 0 {
+        if libc::setresuid(id.uid, id.uid, id.uid) != 0 {
             return Err(format!("setresuid: {}", io::Error::last_os_error()));
         }
-        // Verify the drop actually happened. Guards against kernel bugs or
-        // edge cases where setresuid silently fails -- shouldn't happen on
-        // Linux but belt-and-braces for a security-critical path.
-        if libc::geteuid() == 0 && uid != 0 {
-            return Err("setresuid did not take effect (still euid 0)".into());
-        }
-
-        // Prevent regaining privs via setuid exec in the child's subtree.
-        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-            return Err(format!("PR_SET_NO_NEW_PRIVS: {}", io::Error::last_os_error()));
+        if id.uid != 0 && (libc::geteuid() == 0 || libc::getuid() == 0) {
+            return Err("privilege drop did not take effect".into());
         }
     }
     Ok(())
 }
 
-// Fork the process. The child invokes `run` (as the same user, root still)
-// and exits with whatever code `run` returns. The parent gets the child's
-// pid back. Callers of this function typically want to call
-// drop_to_real_user() first thing inside `run`.
-//
-// The CAUGHT-THEN-REPLACED return type sidesteps FnOnce-in-unsafe issues:
-// we hand the closure to the child via a Box, run it, exit. No return to
-// the caller on the child side.
+// Real uid 0 as well as effective: A process whose real uid is the user's
+// can be killed by that user, and killing the grab holder unlocks X11.
+pub fn become_root() -> Result<(), String> {
+    unsafe {
+        if libc::geteuid() != 0 {
+            return Err("gordian_knot must be installed setuid root (mode 4755)".into());
+        }
+        if libc::setresgid(0, 0, 0) != 0 || libc::setresuid(0, 0, 0) != 0 {
+            return Err(format!("setresuid(0): {}", io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+// The holder keeps the password in memory: No core dump, no ptrace from the
+// user, and the OOM killer leaves it alone (a killed holder is an unlock).
+pub fn harden_holder() {
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
+    let _ = std::fs::write("/proc/self/oom_score_adj", "-1000");
+}
+
+pub fn no_new_privs() -> Result<(), String> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(format!("PR_SET_NO_NEW_PRIVS: {}", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+// Fork; the child runs `run` and _exits with its code.
 pub fn fork_child<F>(run: F) -> Result<i32, String>
 where
     F: FnOnce() -> i32,
 {
-    let pid = unsafe { libc::fork() };
-    match pid {
+    match unsafe { libc::fork() } {
         -1 => Err(format!("fork: {}", io::Error::last_os_error())),
         0 => {
-            // Child. Run the closure and exit. We _exit to avoid running
-            // atexit handlers or global destructors that belong to the
-            // parent.
             let code = run();
             unsafe { libc::_exit(code) };
         }
-        _ => Ok(pid),
+        pid => Ok(pid),
     }
 }
 
-// Wait for a child to exit. Returns the exit code (0-255) or -1 on signal.
-// Ignores EINTR so signal storms don't drop us out of the wait.
+// Exit code of a child, or -1 if a signal ended it. EINTR is retried.
 pub fn wait_child(pid: i32) -> i32 {
-    unsafe {
-        let mut status: libc::c_int = 0;
-        loop {
-            let w = libc::waitpid(pid, &mut status, 0);
-            if w == -1 {
-                if *libc::__errno_location() == libc::EINTR {
-                    continue;
-                }
-                return -1;
+    let mut status: libc::c_int = 0;
+    loop {
+        if unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-            break;
+            return -1;
         }
-        if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -1
-        }
+        break;
+    }
+    if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 }
+}
+
+// Write one byte to the readiness fd the daemon passes in GK_READY_FD, so
+// it knows the lock is up (lock-before-suspend waits on it), then close it.
+pub fn signal_ready() {
+    let Some(fd) = std::env::var("GK_READY_FD").ok().and_then(|v| v.parse::<i32>().ok()) else {
+        return;
+    };
+    unsafe {
+        libc::write(fd, b"1".as_ptr() as *const libc::c_void, 1);
+        libc::close(fd);
     }
 }

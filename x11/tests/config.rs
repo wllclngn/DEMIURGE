@@ -493,3 +493,28 @@ auto_hide_seconds = 0
     assert!(cfg.cursor.auto_hide);
     assert_eq!(cfg.cursor.auto_hide_seconds, 0);
 }
+
+// border_width and focus_model left the schema; configs written before
+// that still carry them and must keep loading.
+#[test]
+fn retired_general_keys_still_load() {
+    let toml = r##"
+[general]
+tags = ["X"]
+border_width = 0
+focus_model = "click"
+"##;
+    assert!(parse_config(toml).is_ok());
+}
+
+#[test]
+fn shipped_default_config_parses_and_binds_lock() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../config.default.toml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("border_width") && !text.contains("focus_model"));
+    let paths = demiurge_x11::config::Paths::with_config(path);
+    let cfg = demiurge_x11::config::load(&paths).unwrap();
+    assert!(cfg.keybinds.iter().any(|k| k.mods == ["Super"]
+        && k.key == "Escape"
+        && k.action == "lock"));
+}

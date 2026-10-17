@@ -21,6 +21,7 @@ fn fresh_client() -> Client {
         saved_floating: None,
         saved_fullscreen: None,
         title: String::new(),
+        urgent: false,
         unmap_ignore: 0,
     }
 }

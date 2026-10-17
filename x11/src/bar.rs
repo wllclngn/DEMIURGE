@@ -302,7 +302,10 @@ impl Bar {
         let colors = BarColors {
             bg: parse_hex_local(&config.bar.bg),
             fg: parse_hex_local(&config.bar.fg),
-            tag_focused_bg: parse_hex_local(&config.bar.tag_focused_bg),
+            tag_focused_bg: parse_hex_local(accent_or_shared(
+                &config.bar.tag_focused_bg,
+                &config.appearance.accent,
+            )),
             tag_focused_fg: parse_hex_local(&config.bar.tag_focused_fg),
             tag_occupied_fg: parse_hex_local(&config.bar.tag_occupied_fg),
             tag_empty_fg: parse_hex_local(&config.bar.tag_empty_fg),
@@ -451,6 +454,7 @@ impl Bar {
         conn: &RustConnection,
         active_tags: &[usize],
         occupied: &[bool],
+        urgent: &[bool],
         center_text: &str,
         is_notification: bool,
     ) {
@@ -489,7 +493,7 @@ impl Bar {
             );
 
             if want_tags {
-                self.render_tags(pi, active_tag, occupied);
+                self.render_tags(pi, active_tag, occupied, urgent);
             }
             if want_prompt {
                 self.render_prompt(pi);
@@ -534,7 +538,8 @@ impl Bar {
     // region's background first to clear stale pixels, then the tags.
     // Also updates self.tag_extents (button-hit map) when rendering the
     // primary panel.
-    fn render_tags(&mut self, pi: usize, active_tag: usize, occupied: &[bool]) {
+    // An urgent tag's label takes the accent until its client is focused.
+    fn render_tags(&mut self, pi: usize, active_tag: usize, occupied: &[bool], urgent: &[bool]) {
         let rect = self.panels[pi].rects.tags;
         let cr = match cairo::Context::new(&self.panels[pi].surface) {
             Ok(c) => c,
@@ -567,6 +572,9 @@ impl Bar {
                 let _ = cr.fill();
                 let (fr, fg, fb) = self.colors.tag_focused_fg;
                 cr.set_source_rgb(fr, fg, fb);
+            } else if urgent.get(i).copied().unwrap_or(false) {
+                let (ur, ug, ub) = self.colors.tag_focused_bg;
+                cr.set_source_rgb(ur, ug, ub);
             } else if occupied[i] {
                 let (or, og, ob) = self.colors.tag_occupied_fg;
                 cr.set_source_rgb(or, og, ob);
@@ -813,7 +821,10 @@ impl Bar {
         self.colors = BarColors {
             bg: parse_hex_local(&config.bar.bg),
             fg: parse_hex_local(&config.bar.fg),
-            tag_focused_bg: parse_hex_local(&config.bar.tag_focused_bg),
+            tag_focused_bg: parse_hex_local(accent_or_shared(
+                &config.bar.tag_focused_bg,
+                &config.appearance.accent,
+            )),
             tag_focused_fg: parse_hex_local(&config.bar.tag_focused_fg),
             tag_occupied_fg: parse_hex_local(&config.bar.tag_occupied_fg),
             tag_empty_fg: parse_hex_local(&config.bar.tag_empty_fg),
@@ -983,6 +994,13 @@ pub fn parse_hex(color: &str) -> (f64, f64, f64) {
 
 fn parse_hex_local(color: &str) -> (f64, f64, f64) {
     crate::torrentius::parse_hex(color)
+}
+
+// Resolve an accent-role colour field: the component's own value if it
+// set one, otherwise the shared [appearance].accent. Empty string =
+// "inherit the desktop accent."
+fn accent_or_shared<'a>(field: &'a str, shared_accent: &'a str) -> &'a str {
+    if field.is_empty() { shared_accent } else { field }
 }
 
 // Escape text for Pango markup so a user-chosen clock_format containing

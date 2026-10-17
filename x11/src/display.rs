@@ -51,6 +51,35 @@ pub fn apply_all(displays: &[Display], monitors: &Monitors) {
     }
 }
 
+// Set one output to a RandR mode by id; xrandr resizes the framebuffer
+// around it as needed.
+pub fn set_mode(output_name: &str, mode: u32) {
+    let status = std::process::Command::new("xrandr")
+        .args(["--output", output_name, "--mode", &format!("0x{:x}", mode)])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("[demiurge] display: {} set to mode 0x{:x}", output_name, mode);
+        }
+        Ok(s) => eprintln!(
+            "[demiurge] display: xrandr exited {} setting {} to mode 0x{:x}",
+            s.code().unwrap_or(-1),
+            output_name,
+            mode,
+        ),
+        Err(e) => eprintln!("[demiurge] display: xrandr spawn failed for '{}': {}", output_name, e),
+    }
+}
+
+// True when a [[display]] entry with a mode matches the output, the same
+// match apply_all uses.
+pub fn pins_mode(displays: &[Display], output_name: &str) -> bool {
+    let name = output_name.to_lowercase();
+    displays
+        .iter()
+        .any(|d| !d.mode.is_empty() && name.contains(&d.r#match.to_lowercase()))
+}
+
 fn apply_one(output_name: &str, d: &Display) {
     let mut cmd = std::process::Command::new("xrandr");
     cmd.arg("--output").arg(output_name);

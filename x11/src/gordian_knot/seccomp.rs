@@ -1,34 +1,116 @@
-// seccomp-bpf syscall allowlist for GORDIAN KNOT's unprivileged child.
+// seccomp-bpf filter for GORDIAN KNOT's UI child, installed after its first
+// accepted frame: By then the X connection, the fonts and the config are
+// already held, so what remains is drawing, sockets and time.
 //
-// Raw BPF + prctl(PR_SET_SECCOMP). No libseccomp. Pattern lifted from
-// ABRAXAS's seccomp.rs; allowlist trimmed to what a locker needs.
+// Raw BPF + prctl(PR_SET_SECCOMP). No libseccomp.
 //
-// Installed AFTER: privsep drop (setresuid/setresgid), X/VT fd acquisition,
-// signalfd setup. Installed BEFORE: the main event loop.
+// An unlisted syscall TRAPs instead of killing: The child's own SIGSYS
+// handler logs "seccomp: denied syscall N" and returns -EPERM, so a gap in
+// the list degrades one call and leaves a line the QEMU suite fails on,
+// rather than a dead renderer. clone is allowed only with CLONE_THREAD (a
+// thread, never a process); clone3 answers ENOSYS, because its flags sit
+// behind a pointer a filter cannot read, and glibc then falls back to
+// clone. No exec, no fork.
 //
-// The allowlist is a superset of what a minimal lock UI would need because
-// PAM internally fork/execs unix_chkpwd (setuid helper that reads /etc/shadow)
-// and we can't restrict argv via plain BPF. Tightening further would require
-// seccomp_notify + an unprivileged supervisor, which is out of scope here.
+// x86_64 only; any other arch is killed outright.
 
-// BPF instruction encoding
 const BPF_LD: u16 = 0x00;
 const BPF_JMP: u16 = 0x05;
 const BPF_RET: u16 = 0x06;
 const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JSET: u16 = 0x40;
 const BPF_K: u16 = 0x00;
 
-// seccomp constants
-const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
-const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_MODE_FILTER: libc::c_int = 2;
 
-const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
-
-const OFFSET_ARCH: u32 = 4;
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const OFFSET_NR: u32 = 0;
+const OFFSET_ARCH: u32 = 4;
+const OFFSET_ARG0_LO: u32 = 16;
+
+const NR_CLONE: u32 = 56;
+const NR_CLONE3: u32 = 435;
+const CLONE_THREAD: u32 = 0x0001_0000;
+
+// x86_64 numbers (asm/unistd_64.h): What Cairo, Pango, fontconfig, glib's
+// threads and the x11rb socket need once the child is initialized.
+const ALLOWED: &[u32] = &[
+    0,   // read
+    1,   // write
+    3,   // close
+    5,   // fstat
+    7,   // poll
+    8,   // lseek
+    9,   // mmap
+    10,  // mprotect
+    11,  // munmap
+    12,  // brk
+    13,  // rt_sigaction
+    14,  // rt_sigprocmask
+    15,  // rt_sigreturn
+    17,  // pread64
+    19,  // readv
+    20,  // writev
+    21,  // access
+    24,  // sched_yield
+    25,  // mremap
+    28,  // madvise
+    35,  // nanosleep
+    39,  // getpid
+    44,  // sendto
+    45,  // recvfrom
+    46,  // sendmsg
+    47,  // recvmsg
+    60,  // exit
+    63,  // uname
+    72,  // fcntl
+    79,  // getcwd
+    89,  // readlink
+    96,  // gettimeofday
+    102, // getuid
+    104, // getgid
+    107, // geteuid
+    108, // getegid
+    110, // getppid
+    131, // sigaltstack
+    137, // statfs
+    138, // fstatfs
+    157, // prctl (thread names; NO_NEW_PRIVS is already set)
+    186, // gettid
+    202, // futex
+    204, // sched_getaffinity
+    217, // getdents64
+    218, // set_tid_address
+    219, // restart_syscall
+    228, // clock_gettime
+    229, // clock_getres
+    230, // clock_nanosleep
+    231, // exit_group
+    232, // epoll_wait
+    233, // epoll_ctl
+    234, // tgkill
+    257, // openat
+    262, // newfstatat
+    267, // readlinkat
+    271, // ppoll
+    273, // set_robust_list
+    281, // epoll_pwait
+    290, // eventfd2
+    291, // epoll_create1
+    293, // pipe2
+    302, // prlimit64
+    318, // getrandom
+    324, // membarrier
+    332, // statx
+    334, // rseq
+    439, // faccessat2
+];
 
 #[repr(C)]
 struct SockFilter {
@@ -44,191 +126,80 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-const fn bpf_stmt(code: u16, k: u32) -> SockFilter {
+const fn stmt(code: u16, k: u32) -> SockFilter {
     SockFilter { code, jt: 0, jf: 0, k }
 }
 
-const fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
+const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
-// x86_64 syscall numbers (from asm/unistd_64.h). A subset of ABRAXAS's list,
-// plus PAM-specific entries.
-mod nr {
-    pub const READ: u32 = 0;
-    pub const WRITE: u32 = 1;
-    pub const CLOSE: u32 = 3;
-    pub const FSTAT: u32 = 5;
-    pub const POLL: u32 = 7;
-    pub const LSEEK: u32 = 8;
-    pub const MMAP: u32 = 9;
-    pub const MPROTECT: u32 = 10;
-    pub const MUNMAP: u32 = 11;
-    pub const BRK: u32 = 12;
-    pub const RT_SIGACTION: u32 = 13;
-    pub const RT_SIGPROCMASK: u32 = 14;
-    pub const RT_SIGRETURN: u32 = 15;
-    pub const IOCTL: u32 = 16;
-    pub const PREAD64: u32 = 17;
-    pub const WRITEV: u32 = 20;
-    pub const ACCESS: u32 = 21;
-    pub const PIPE: u32 = 22;
-    pub const SELECT: u32 = 23;
-    pub const SCHED_YIELD: u32 = 24;
-    pub const MREMAP: u32 = 25;
-    pub const MADVISE: u32 = 28;
-    pub const DUP: u32 = 32;
-    pub const DUP2: u32 = 33;
-    pub const NANOSLEEP: u32 = 35;
-    pub const GETPID: u32 = 39;
-    pub const SOCKET: u32 = 41;
-    pub const CONNECT: u32 = 42;
-    pub const SENDTO: u32 = 44;
-    pub const RECVFROM: u32 = 45;
-    pub const SENDMSG: u32 = 46;
-    pub const RECVMSG: u32 = 47;
-    pub const SHUTDOWN: u32 = 48;
-    pub const SETSOCKOPT: u32 = 54;
-    pub const GETSOCKOPT: u32 = 55;
-    pub const CLONE: u32 = 56;
-    pub const FORK: u32 = 57;
-    pub const VFORK: u32 = 58;
-    pub const EXECVE: u32 = 59;
-    pub const EXIT: u32 = 60;
-    pub const WAIT4: u32 = 61;
-    pub const KILL: u32 = 62;
-    pub const UNAME: u32 = 63;
-    pub const FCNTL: u32 = 72;
-    pub const GETCWD: u32 = 79;
-    pub const READLINK: u32 = 89;
-    pub const GETTIMEOFDAY: u32 = 96;
-    pub const GETUID: u32 = 102;
-    pub const GETGID: u32 = 104;
-    pub const GETEUID: u32 = 107;
-    pub const GETEGID: u32 = 108;
-    pub const GETPPID: u32 = 110;
-    pub const GETPGID: u32 = 121;
-    pub const SIGALTSTACK: u32 = 131;
-    pub const ARCH_PRCTL: u32 = 158;
-    pub const GETTID: u32 = 186;
-    pub const FUTEX: u32 = 202;
-    pub const SCHED_GETAFFINITY: u32 = 204;
-    pub const GETDENTS64: u32 = 217;
-    pub const SET_TID_ADDRESS: u32 = 218;
-    pub const CLOCK_GETTIME: u32 = 228;
-    pub const CLOCK_NANOSLEEP: u32 = 230;
-    pub const EXIT_GROUP: u32 = 231;
-    pub const EPOLL_WAIT: u32 = 232;
-    pub const EPOLL_CTL: u32 = 233;
-    pub const TGKILL: u32 = 234;
-    pub const OPENAT: u32 = 257;
-    pub const NEWFSTATAT: u32 = 262;
-    pub const READLINKAT: u32 = 267;
-    pub const PPOLL: u32 = 271;
-    pub const SET_ROBUST_LIST: u32 = 273;
-    pub const EPOLL_PWAIT: u32 = 281;
-    pub const SIGNALFD4: u32 = 289;
-    pub const EVENTFD2: u32 = 290;
-    pub const EPOLL_CREATE1: u32 = 291;
-    pub const DUP3: u32 = 292;
-    pub const PIPE2: u32 = 293;
-    pub const PRLIMIT64: u32 = 302;
-    pub const GETRANDOM: u32 = 318;
-    pub const STATX: u32 = 332;
-    pub const RSEQ: u32 = 334;
-    pub const CLONE3: u32 = 435;
-    pub const FACCESSAT2: u32 = 439;
+fn program() -> Vec<SockFilter> {
+    let mut f = vec![
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
+        jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+        stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
+    ];
+    for &nr in ALLOWED {
+        f.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
+        f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    }
+    f.push(jump(BPF_JMP | BPF_JEQ | BPF_K, NR_CLONE3, 0, 1));
+    f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
+    f.push(jump(BPF_JMP | BPF_JEQ | BPF_K, NR_CLONE, 0, 3));
+    f.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARG0_LO));
+    f.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_THREAD, 0, 1));
+    f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    f.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_TRAP));
+    f
 }
 
-fn allow(nr: u32) -> [SockFilter; 2] {
-    [
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1),
-        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-    ]
+// The denied syscall's number from siginfo's SIGSYS layout (si_call_addr,
+// then si_syscall at offset 24 on x86_64), reported with write(2) only:
+// Nothing here may allocate or lock.
+extern "C" fn on_sigsys(_sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    unsafe {
+        let nr = *((info as *const u8).add(24) as *const i32);
+        let uc = ctx as *mut libc::ucontext_t;
+        (*uc).uc_mcontext.gregs[libc::REG_RAX as usize] = -(libc::EPERM as i64);
+
+        let prefix = b"[gordian_knot ui] seccomp: denied syscall ";
+        let mut buf = [0u8; 64];
+        buf[..prefix.len()].copy_from_slice(prefix);
+        let mut n = prefix.len();
+        let mut digits = [0u8; 10];
+        let mut d = 0;
+        let mut v = nr.unsigned_abs();
+        loop {
+            digits[d] = b'0' + (v % 10) as u8;
+            d += 1;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        while d > 0 {
+            d -= 1;
+            buf[n] = digits[d];
+            n += 1;
+        }
+        buf[n] = b'\n';
+        libc::write(2, buf.as_ptr() as *const libc::c_void, n + 1);
+    }
 }
 
 pub fn install_filter() -> bool {
-    let mut filter: Vec<SockFilter> = vec![
-        // Arch check: kill if not x86_64.
-        bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARCH),
-        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
-        bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
-        // Load syscall number.
-        bpf_stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR),
-    ];
-
-    // Core I/O.
-    for n in [nr::READ, nr::WRITE, nr::OPENAT, nr::CLOSE, nr::FSTAT, nr::NEWFSTATAT,
-              nr::LSEEK, nr::PREAD64, nr::WRITEV, nr::DUP, nr::DUP2, nr::DUP3,
-              nr::FCNTL, nr::IOCTL, nr::POLL, nr::PPOLL, nr::SELECT] {
-        filter.extend(allow(n));
-    }
-
-    // Memory.
-    for n in [nr::MMAP, nr::MUNMAP, nr::MPROTECT, nr::BRK, nr::MREMAP, nr::MADVISE] {
-        filter.extend(allow(n));
-    }
-
-    // Time.
-    for n in [nr::CLOCK_GETTIME, nr::CLOCK_NANOSLEEP, nr::NANOSLEEP, nr::GETTIMEOFDAY] {
-        filter.extend(allow(n));
-    }
-
-    // Process/PAM (pam_unix forks unix_chkpwd).
-    for n in [nr::CLONE, nr::CLONE3, nr::FORK, nr::VFORK, nr::EXECVE, nr::WAIT4,
-              nr::EXIT, nr::EXIT_GROUP, nr::KILL, nr::TGKILL, nr::ARCH_PRCTL,
-              nr::SET_TID_ADDRESS, nr::SET_ROBUST_LIST, nr::RSEQ, nr::PRLIMIT64] {
-        filter.extend(allow(n));
-    }
-
-    // Process info.
-    for n in [nr::GETPID, nr::GETPPID, nr::GETTID, nr::GETPGID, nr::UNAME,
-              nr::GETUID, nr::GETGID, nr::GETEUID, nr::GETEGID] {
-        filter.extend(allow(n));
-    }
-
-    // Signals + signalfd.
-    for n in [nr::RT_SIGACTION, nr::RT_SIGPROCMASK, nr::RT_SIGRETURN, nr::SIGALTSTACK,
-              nr::SIGNALFD4] {
-        filter.extend(allow(n));
-    }
-
-    // File ops.
-    for n in [nr::ACCESS, nr::FACCESSAT2, nr::READLINK, nr::READLINKAT, nr::GETCWD,
-              nr::STATX, nr::GETDENTS64, nr::GETRANDOM, nr::PIPE, nr::PIPE2] {
-        filter.extend(allow(n));
-    }
-
-    // Sockets (X11 connection, zbus D-Bus in daemon mode).
-    for n in [nr::SOCKET, nr::CONNECT, nr::SETSOCKOPT, nr::GETSOCKOPT,
-              nr::SENDTO, nr::SENDMSG, nr::RECVFROM, nr::RECVMSG, nr::SHUTDOWN] {
-        filter.extend(allow(n));
-    }
-
-    // epoll (rust runtime, zbus).
-    for n in [nr::EPOLL_CREATE1, nr::EPOLL_CTL, nr::EPOLL_WAIT, nr::EPOLL_PWAIT,
-              nr::EVENTFD2] {
-        filter.extend(allow(n));
-    }
-
-    // Futex + scheduler (Rust allocator / threading runtime).
-    for n in [nr::FUTEX, nr::SCHED_YIELD, nr::SCHED_GETAFFINITY] {
-        filter.extend(allow(n));
-    }
-
-    // Default action: kill.
-    filter.push(bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS));
-
-    let prog = SockFprog {
-        len: filter.len() as u16,
-        filter: filter.as_ptr(),
-    };
-
     unsafe {
-        libc::prctl(
-            libc::PR_SET_SECCOMP,
-            SECCOMP_MODE_FILTER,
-            &prog as *const SockFprog,
-        ) == 0
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigsys as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut sa.sa_mask);
+        if libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) != 0 {
+            return false;
+        }
     }
+    let filter = program();
+    let prog = SockFprog { len: filter.len() as u16, filter: filter.as_ptr() };
+    unsafe { libc::prctl(libc::PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog as *const SockFprog) == 0 }
 }

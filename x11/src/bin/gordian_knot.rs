@@ -1,48 +1,65 @@
-// GORDIAN KNOT -- VT + X11 screen locker.
+// GORDIAN KNOT -- X11 / VT / Wayland screen locker, idle daemon and greetd
+// greeter. Installed setuid root; every mode settles its privilege first:
 //
-// Dispatcher logic:
-//   --vt        force the VT path (text-mode lock on a fresh TTY)
-//   --daemon    idle-watcher mode (poll XScreenSaver, trigger lock on idle)
-//   (default)   try X11 in-session lock; fall back to VT if the grab fails
-//               or $DISPLAY is unset
+//   (default)   lock this session: X11 when $DISPLAY is set, falling back
+//               to the VT lock only if nothing was locked; Wayland when
+//               $WAYLAND_DISPLAY is set; else the VT lock
+//   --x11 / --vt  force one path
+//   --wl        Wayland ext-session-lock (runs as the user)
+//   --daemon    idle + lock-before-suspend watcher (runs as the user)
+//   --login     greetd greeter (runs as the user)
+//   --ui FD WIN internal: the X11 lock's renderer, exec'd by the holder
 //
-// Privilege model:
-//   X11 path:   runs entirely as the invoking user. No setuid needed.
-//               PAM delegates shadow access to unix_chkpwd (setuid helper).
-//   VT path:    requires setuid-root at install time. Parent holds root
-//               to drive VT ioctls; child forks + drops to the invoking
-//               user before PAM + UI.
-//   Daemon:     runs as the invoking user. Spawns a fresh `gordian_knot`
-//               (this binary, without --daemon) when the idle threshold
-//               is crossed. The respawned process picks X11 or VT itself.
+// The X11 and VT holders become root fully and never set NO_NEW_PRIVS
+// (PAM's unix_chkpwd needs its setuid bit); see gordian_knot/privsep.rs.
 
 use std::env;
 use std::process::ExitCode;
 
 use demiurge_x11::config;
-use demiurge_x11::gordian_knot::{daemon, landlock, privsep, seccomp, vt, x11_lock};
+use demiurge_x11::gordian_knot::privsep::{self, Ident};
+use demiurge_x11::gordian_knot::x11_lock::LockError;
+use demiurge_x11::gordian_knot::{daemon, login, ui, vt, wl_lock, x11_lock};
 
 enum Mode {
     Auto,
     ForceVt,
     ForceX11,
+    ForceWl,
     Daemon,
+    Login,
     CheckConfig,
+    Ui(i32, u32),
     Help,
     Version,
 }
 
 fn parse_args() -> (Mode, bool) {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = env::args().skip(1).collect();
     let mut mode = Mode::Auto;
     let mut no_sandbox = false;
-    for a in args.iter().skip(1) {
-        match a.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--vt" => mode = Mode::ForceVt,
             "--x11" => mode = Mode::ForceX11,
+            "--wl" => mode = Mode::ForceWl,
             "--daemon" => mode = Mode::Daemon,
+            "--login" => mode = Mode::Login,
             "--check-config" => mode = Mode::CheckConfig,
             "--no-sandbox" => no_sandbox = true,
+            "--ui" => {
+                let fd = args.get(i + 1).and_then(|s| s.parse().ok());
+                let win = args.get(i + 2).and_then(|s| s.parse().ok());
+                match (fd, win) {
+                    (Some(fd), Some(win)) => mode = Mode::Ui(fd, win),
+                    _ => {
+                        eprintln!("[gordian_knot] --ui takes FD WINDOW");
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
             "-h" | "--help" => mode = Mode::Help,
             "-v" | "--version" => mode = Mode::Version,
             other => {
@@ -50,111 +67,69 @@ fn parse_args() -> (Mode, bool) {
                 std::process::exit(1);
             }
         }
+        i += 1;
     }
     (mode, no_sandbox)
 }
 
 fn print_help() {
     println!(
-        "usage: gordian_knot [--vt | --x11 | --daemon | --check-config] [--no-sandbox] [-v] [-h]\n\
+        "usage: gordian_knot [--vt | --x11 | --wl | --daemon | --login | --check-config] [--no-sandbox] [-v] [-h]\n\
          \n\
-         Default:        X11 in-session lock (fallback to VT if grab fails)\n\
-         --vt            Force VT locker (text-mode on a fresh TTY)\n\
-         --x11           Force X11 in-session lock (error if not available)\n\
-         --daemon        Idle-watcher mode (spawns gordian_knot on idle)\n\
+         Default:        Lock this session: --wl if $WAYLAND_DISPLAY is set, else\n\
+                         --x11 (with the VT lock as fallback if nothing locked),\n\
+                         else --vt\n\
+         --vt            VT lock (text mode on a fresh TTY, switching locked)\n\
+         --x11           X11 in-session lock\n\
+         --wl            Wayland in-session lock via ext-session-lock-v1\n\
+         --daemon        Idle + lock-before-suspend watcher\n\
+         --login         greetd greeter mode (drives PAM via $GREETD_SOCK)\n\
          --check-config  Parse ~/.config/demiurge/config.toml and exit\n\
-         --no-sandbox    Skip seccomp + landlock (debug only)"
+         --no-sandbox    Skip the X11 renderer's seccomp + landlock (debug only)"
     );
 }
 
 fn load_config() -> Result<config::Config, String> {
     let paths = config::Paths::init()?;
-    config::load(&paths)
+    let mut cfg = config::load(&paths)?;
+    // An empty [gordian_knot] accent inherits the shared [appearance] accent.
+    if cfg.gordian_knot.accent.is_empty() {
+        cfg.gordian_knot.accent = cfg.appearance.accent.clone();
+    }
+    Ok(cfg)
 }
 
-fn current_username() -> String {
-    unsafe {
-        let uid = libc::getuid();
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            return String::from("user");
-        }
-        std::ffi::CStr::from_ptr((*pw).pw_name)
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-fn install_sandbox(no_sandbox: bool) {
-    if no_sandbox {
-        eprintln!("[gordian_knot] --no-sandbox: seccomp + landlock skipped");
-        return;
-    }
-    if !landlock::install_sandbox() {
-        eprintln!("[gordian_knot] landlock unavailable (kernel <5.13?); continuing");
-    }
-    if !seccomp::install_filter() {
-        eprintln!("[gordian_knot] seccomp install failed; continuing without filter");
+fn as_user(ident: &Ident) {
+    if let Err(e) = privsep::drop_to_user(ident) {
+        eprintln!("[gordian_knot] {}", e);
+        std::process::exit(1);
     }
 }
 
-// X11 path. No setuid needed. Runs as user. PAM + UI + sandbox all in
-// this process.
-fn run_x11(cfg: &config::GordianKnot, user: &str, no_sandbox: bool) -> i32 {
-    install_sandbox(no_sandbox);
-    match x11_lock::lock(cfg, user) {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("[gordian_knot] x11 lock: {}", e);
-            1
-        }
+fn as_holder() {
+    if let Err(e) = privsep::become_root() {
+        eprintln!("[gordian_knot] {}", e);
+        std::process::exit(1);
     }
-}
-
-// VT path. Parent stays root, does VT ioctls. Child drops to user, runs
-// sandbox + PAM. Parent waits + releases VT on child exit.
-fn run_vt(cfg: &config::GordianKnot, user: &str, no_sandbox: bool) -> i32 {
-    let _ = cfg; // VT UI is text-only; only the user name + prompt are read.
-
-    let mut session = match vt::acquire() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[gordian_knot] VT acquire: {}", e);
-            return 1;
-        }
-    };
-
-    let prompt = cfg.prompt.clone();
-    let user_owned = user.to_string();
-    let tty_fd = session.tty_fd;
-
-    let pid = match privsep::fork_child(move || {
-        if let Err(e) = privsep::drop_to_real_user() {
-            eprintln!("[gordian_knot] privsep drop: {}", e);
-            return 1;
-        }
-        install_sandbox(no_sandbox);
-        vt::prompt_loop(tty_fd, &user_owned, &prompt)
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[gordian_knot] fork: {}", e);
-            vt::release(&mut session);
-            return 1;
-        }
-    };
-
-    let code = privsep::wait_child(pid);
-    vt::release(&mut session);
-    if code == 0 {
-        0
-    } else {
-        1
-    }
+    privsep::harden_holder();
 }
 
 fn main() -> ExitCode {
     let (mode, no_sandbox) = parse_args();
+    let ident = privsep::invoking_user();
+    // Resolved before any credential change: Afterwards /proc/self belongs
+    // to root (a setuid exec leaves the process non-dumpable).
+    let self_bin = env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "gordian_knot".into());
+
+    let auto_wl = matches!(mode, Mode::Auto) && env::var_os("WAYLAND_DISPLAY").is_some();
+    let holder = !auto_wl && matches!(mode, Mode::Auto | Mode::ForceX11 | Mode::ForceVt);
+    if holder {
+        as_holder();
+    } else if !matches!(mode, Mode::Ui(..)) {
+        as_user(&ident);
+    }
 
     match mode {
         Mode::Help => {
@@ -164,6 +139,9 @@ fn main() -> ExitCode {
         Mode::Version => {
             println!("gordian_knot {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
+        }
+        Mode::Ui(fd, win) => {
+            return code(ui::run(fd, win, !no_sandbox));
         }
         Mode::CheckConfig => {
             return match load_config() {
@@ -187,48 +165,59 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let gk = &cfg.gordian_knot;
 
-    let user = current_username();
-
-    let code = match mode {
-        Mode::ForceVt => run_vt(&cfg.gordian_knot, &user, no_sandbox),
-        Mode::ForceX11 => run_x11(&cfg.gordian_knot, &user, no_sandbox),
+    code(match mode {
+        Mode::ForceVt => vt::lock(&gk.prompt, &ident),
+        Mode::ForceX11 => match x11_lock::lock(gk, &ident, !no_sandbox) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[gordian_knot] {}", e);
+                1
+            }
+        },
+        Mode::ForceWl => run_wl(gk, &ident.name),
+        Mode::Auto if auto_wl => run_wl(gk, &ident.name),
+        Mode::Auto if env::var_os("DISPLAY").is_some() => match x11_lock::lock(gk, &ident, !no_sandbox) {
+            Ok(()) => 0,
+            Err(LockError::Unavailable(e)) => {
+                eprintln!("[gordian_knot] X11 lock unavailable ({}); falling back to the VT lock", e);
+                vt::lock(&gk.prompt, &ident)
+            }
+            Err(e) => {
+                eprintln!("[gordian_knot] {}", e);
+                1
+            }
+        },
+        Mode::Auto => vt::lock(&gk.prompt, &ident),
+        Mode::Login => login::run(&login::LoginConfig {
+            session_cmd: gk.session_cmd.clone(),
+            session_env: gk.session_env.clone(),
+        }),
         Mode::Daemon => {
-            // Path to our own binary so the daemon can respawn us for each
-            // lock session. argv[0] is what the kernel was asked to exec.
-            let self_bin = env::args().next().unwrap_or_else(|| "gordian_knot".into());
-            // Resolve idle threshold: prefer the new [input.idle]
-            // lock_seconds (single source of truth for "when does
-            // the session go dark" thresholds). Fall back to the
-            // legacy [gordian_knot] idle_timeout_seconds if the new
-            // field is left at 0, so existing configs migrate without
-            // breaking.
+            // [input.idle].lock_seconds is the source of truth; the legacy
+            // [gordian_knot].idle_timeout_seconds applies when it is 0.
             let threshold = if cfg.input.idle.lock_seconds > 0 {
                 cfg.input.idle.lock_seconds as u64
             } else {
-                cfg.gordian_knot.idle_timeout_seconds
+                gk.idle_timeout_seconds
             };
             daemon::run(threshold, &self_bin)
         }
-        Mode::Auto => {
-            if env::var_os("DISPLAY").is_some() {
-                let rc = run_x11(&cfg.gordian_knot, &user, no_sandbox);
-                if rc == 0 {
-                    0
-                } else {
-                    // X11 grab failed or errored -- try VT as fallback.
-                    eprintln!("[gordian_knot] falling back to VT lock");
-                    run_vt(&cfg.gordian_knot, &user, no_sandbox)
-                }
-            } else {
-                run_vt(&cfg.gordian_knot, &user, no_sandbox)
-            }
-        }
-        _ => unreachable!(),
-    };
+        Mode::Help | Mode::Version | Mode::CheckConfig | Mode::Ui(..) => unreachable!(),
+    })
+}
 
-    match code {
-        0 => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
+fn run_wl(gk: &config::GordianKnot, user: &str) -> i32 {
+    match wl_lock::run(gk, user) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("[gordian_knot] wl lock: {}", e);
+            1
+        }
     }
+}
+
+fn code(c: i32) -> ExitCode {
+    if c == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }

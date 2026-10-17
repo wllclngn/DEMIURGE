@@ -38,6 +38,43 @@ INSTALL_SERVICE = _real_home / ".config" / "systemd" / "user" / "cherrypie.servi
 BUILD_DIR = Path("/tmp/cherrypie-build")
 
 
+def retarget(name: str | None, target_dir: str | None) -> bool:
+    """Rebind the install paths to an explicitly named account, and the
+    build to a shared target directory. Both come from the DEMIURGE
+    orchestrator: --user because $SUDO_USER doesn't exist inside an
+    arch-chroot, --target-dir so the workspace build's compiled
+    dependencies get reused instead of recompiled here."""
+    global _real_user, _real_home, INSTALL_BINARY, INSTALL_CONFIG_DIR
+    global INSTALL_SERVICE, BUILD_DIR
+
+    if target_dir:
+        BUILD_DIR = Path(target_dir)
+    if not name:
+        return True
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        log_error(f"No such user: {name}")
+        return False
+    _real_user = pw.pw_name
+    _real_home = Path(pw.pw_dir)
+    INSTALL_BINARY = _real_home / ".local" / "bin" / "cherrypie"
+    INSTALL_CONFIG_DIR = _real_home / ".config" / "cherrypie"
+    INSTALL_SERVICE = _real_home / ".config" / "systemd" / "user" / "cherrypie.service"
+    return True
+
+
+def chown_to_real_user(path: Path) -> None:
+    """Hand a file we wrote as root to the account that will use it."""
+    if os.geteuid() != 0:
+        return
+    try:
+        pw = pwd.getpwnam(_real_user)
+        os.chown(path, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError) as e:
+        log_warn(f"chown {path}: {e}")
+
+
 # LOGGING
 
 def _timestamp() -> str:
@@ -70,26 +107,47 @@ def run_cmd_capture(cmd: list, cwd: Path | None = None) -> tuple[int, str, str]:
 
 
 def get_systemctl_cmd() -> list:
-    if os.environ.get("SUDO_USER"):
-        return ["systemctl", f"--machine={os.environ['SUDO_USER']}@.host", "--user"]
+    if os.geteuid() == 0:
+        return ["systemctl", f"--machine={_real_user}@.host", "--user"]
     return ["systemctl", "--user"]
+
+
+def user_manager_running() -> bool:
+    """Whether _real_user has a systemd user manager to talk to. There
+    isn't one inside an arch-chroot, and every systemctl --user call
+    there is a slow guaranteed failure."""
+    try:
+        uid = pwd.getpwnam(_real_user).pw_uid
+    except KeyError:
+        return False
+    return Path(f"/run/user/{uid}/bus").exists()
 
 
 # SERVICE MANAGEMENT
 
 def is_service_enabled() -> bool:
+    if not user_manager_running():
+        return False
     cmd = get_systemctl_cmd() + ["is-enabled", "cherrypie.service"]
     ret, _, _ = run_cmd_capture(cmd)
     return ret == 0
 
 
 def is_service_active() -> bool:
+    if not user_manager_running():
+        return False
     cmd = get_systemctl_cmd() + ["is-active", "cherrypie.service"]
     ret, _, _ = run_cmd_capture(cmd)
     return ret == 0
 
 
 def enable_service() -> bool:
+    if not user_manager_running():
+        log_warn("No systemd user manager for "
+                 f"{_real_user}; enable cherrypie.service after first boot:")
+        log_warn("  systemctl --user enable --now cherrypie.service")
+        return True
+
     log_info("Enabling cherrypie service...")
 
     base_cmd = get_systemctl_cmd()
@@ -118,6 +176,10 @@ def disable_service() -> bool:
 
 
 def stop_all_cherrypie() -> None:
+    if not user_manager_running():
+        # Nothing is running on a machine that isn't booted yet.
+        return
+
     base_cmd = get_systemctl_cmd()
 
     try:
@@ -195,9 +257,10 @@ def cmd_install(args, source_dir: Path) -> bool:
     # Create directories
     log_info("Creating directories...")
     try:
-        INSTALL_BINARY.parent.mkdir(parents=True, exist_ok=True)
-        INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
+        for d in (INSTALL_BINARY.parent, INSTALL_CONFIG_DIR,
+                  INSTALL_SERVICE.parent):
+            d.mkdir(parents=True, exist_ok=True)
+            chown_to_real_user(d)
     except OSError as e:
         log_error(f"Failed to create directories: {e}")
         return False
@@ -223,32 +286,28 @@ def cmd_install(args, source_dir: Path) -> bool:
     else:
         log_warn("Systemd service file not found in source")
 
-    # Fix ownership if running as root
-    if os.environ.get("SUDO_USER"):
-        try:
-            pw = pwd.getpwnam(_real_user)
-            uid, gid = pw.pw_uid, pw.pw_gid
-            os.chown(INSTALL_BINARY, uid, gid)
-            if INSTALL_SERVICE.exists():
-                os.chown(INSTALL_SERVICE, uid, gid)
-        except (KeyError, OSError) as e:
-            log_warn(f"Failed to fix ownership: {e}")
+    chown_to_real_user(INSTALL_BINARY)
+    if INSTALL_SERVICE.exists():
+        chown_to_real_user(INSTALL_SERVICE)
 
     print()
     log_info("Installation complete")
     log_info(f"Binary:  {INSTALL_BINARY}")
-    log_info(f"Config:  {INSTALL_CONFIG_DIR / 'config.toml'}")
+    log_info(f"Config:  {INSTALL_CONFIG_DIR / 'config.toml'} (learned: a rule per new window class)")
 
     # Offer to enable service
     if not args.no_service and INSTALL_SERVICE.exists():
         if not is_service_enabled():
-            print()
-            try:
-                response = input("Enable cherrypie service? [Y/N]: ").strip().lower()
-                if response in ("", "y", "yes"):
-                    enable_service()
-            except EOFError:
-                pass
+            if args.yes:
+                enable_service()
+            else:
+                print()
+                try:
+                    response = input("Enable cherrypie service? [Y/N]: ").strip().lower()
+                    if response in ("", "y", "yes"):
+                        enable_service()
+                except EOFError:
+                    pass
         else:
             restart_service()
 
@@ -301,7 +360,7 @@ def cmd_status(args, source_dir: Path) -> bool:
     print()
 
     print(f"  Config:   {INSTALL_CONFIG_DIR / 'config.toml'}")
-    print(f"            {'exists' if config_ok else 'NOT FOUND'}")
+    print(f"            {'exists' if config_ok else 'not yet written (created by the first new window)'}")
     print()
 
     if service_ok:
@@ -360,13 +419,7 @@ def cmd_update(args, source_dir: Path) -> bool:
     log_info("Installing update...")
     shutil.copy2(BUILD_DIR / "release" / "cherrypie", INSTALL_BINARY)
     INSTALL_BINARY.chmod(0o755)
-
-    if os.environ.get("SUDO_USER"):
-        try:
-            pw = pwd.getpwnam(_real_user)
-            os.chown(INSTALL_BINARY, pw.pw_uid, pw.pw_gid)
-        except (KeyError, OSError) as e:
-            log_warn(f"Failed to fix ownership: {e}")
+    chown_to_real_user(INSTALL_BINARY)
 
     restart_service()
     log_info("Update complete")
@@ -404,6 +457,15 @@ Examples:
                        help="Command to run (default: install)")
     parser.add_argument("--no-service", action="store_true",
                        help="Don't prompt to enable service after install")
+    parser.add_argument("-y", "--yes", action="store_true",
+                       help="Assume yes to prompts (non-interactive installs)")
+    parser.add_argument("--user", metavar="NAME",
+                       help="Account whose $HOME receives the binary, config "
+                            "and user unit (default: $SUDO_USER, else you)")
+    parser.add_argument("--target-dir", metavar="DIR",
+                       help="Cargo target directory to build into. Point it "
+                            "at a shared workspace build to reuse its "
+                            "compiled dependencies.")
 
     args = parser.parse_args()
     source_dir = Path(__file__).parent.resolve()
@@ -411,6 +473,9 @@ Examples:
     print()
     log_info("cherrypie installer")
     log_info(f"Source: {source_dir}")
+
+    if not retarget(args.user, args.target_dir):
+        return 1
     print()
 
     commands = {

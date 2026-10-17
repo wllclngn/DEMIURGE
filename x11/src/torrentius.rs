@@ -49,6 +49,21 @@ pub fn capture_region_to_png(
     h: u32,
     path: &Path,
 ) -> Result<(), String> {
+    let surface = capture_region_to_surface(conn, drawable, x, y, w, h)?;
+    surface_to_png(&surface, path)
+}
+
+// Grab a region as an in-memory Cairo Rgb24 surface. MEDUSA uses this
+// to hold the frozen screenshot for dimming + cropping; the PNG
+// variant above is the thin "capture then write" wrapper.
+pub fn capture_region_to_surface(
+    conn: &RustConnection,
+    drawable: Window,
+    x: i16,
+    y: i16,
+    w: u32,
+    h: u32,
+) -> Result<cairo::ImageSurface, String> {
     let reply = conn
         .get_image(ImageFormat::Z_PIXMAP, drawable, x, y, w as u16, h as u16, !0u32)
         .map_err(|e| format!("get_image: {}", e))?
@@ -84,7 +99,27 @@ pub fn capture_region_to_png(
                 .copy_from_slice(&src[src_off..src_off + row_bytes]);
         }
     }
+    Ok(surface)
+}
 
+// Grab the whole root as an in-memory surface. The MEDUSA overlay's
+// frozen backdrop. Only used by the medusa binary, so it reads as
+// dead code when the demiurge WM binary is built alone.
+#[allow(dead_code)]
+pub fn capture_root_to_surface(
+    conn: &RustConnection,
+    root: Window,
+) -> Result<cairo::ImageSurface, String> {
+    let geom = conn
+        .get_geometry(root)
+        .map_err(|e| format!("get_geometry: {}", e))?
+        .reply()
+        .map_err(|e| format!("get_geometry reply: {}", e))?;
+    capture_region_to_surface(conn, root, 0, 0, geom.width as u32, geom.height as u32)
+}
+
+// Write any Cairo surface to a PNG path, creating parent dirs.
+pub fn surface_to_png(surface: &cairo::ImageSurface, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {:?}: {}", parent, e))?;
     }

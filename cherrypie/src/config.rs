@@ -87,15 +87,20 @@ pub struct Rule {
     pub opacity: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub rule: Vec<Rule>,
 }
 
+// A missing file is an empty rule set, not an error: The daemon learns its
+// rules from the windows it sees and creates the file with the first one.
 pub fn load(paths: &Paths) -> Result<Config, String> {
-    let content = fs::read_to_string(&paths.config_file).map_err(|e| {
-        format!("{}: {}", paths.config_file.display(), e)
-    })?;
+    let content = match fs::read_to_string(&paths.config_file) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(format!("{}: {}", paths.config_file.display(), e)),
+    };
 
     let config: Config = toml::from_str(&content).map_err(|e| {
         format!("{}: {}", paths.config_file.display(), e)

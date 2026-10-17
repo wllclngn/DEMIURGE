@@ -6,6 +6,7 @@ Environment=DISPLAY=:0
 ExecStart=%h/.local/bin/abraxas --daemon
 Restart=always
 RestartSec=5
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=default.target

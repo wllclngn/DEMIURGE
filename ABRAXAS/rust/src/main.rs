@@ -10,7 +10,6 @@
 //!   --reset          Restore gamma and exit
 //!   --help           Show usage
 
-mod config;
 mod daemon;
 mod gamma;
 mod landlock;
@@ -22,6 +21,8 @@ mod weather;
 mod zipdb;
 
 use std::process;
+
+use abraxas::{config, now_epoch};
 
 /// Temperature bounds (Kelvin)
 pub const TEMP_MIN: i32 = 1000;
@@ -39,7 +40,6 @@ pub const CLOUD_THRESHOLD: i32 = 60;
 pub const CLOUD_TRANSITION_MIN: f64 = 10.0;
 
 /// Timing
-pub const WEATHER_REFRESH_SEC: i64 = 900; // 15 minutes
 pub const TEMP_UPDATE_SEC: i64 = 60; // 1 minute
 
 /// Transition windows (minutes)
@@ -54,6 +54,11 @@ pub const DUSK_OFFSET: f64 = 30.0;
 
 /// Sigmoid steepness for transitions
 pub const SIGMOID_STEEPNESS: f64 = 8.0;
+
+/// Exit status for a config the daemon cannot run from (sysexits EX_CONFIG).
+/// abraxas.service names it in RestartPreventExitStatus, so a bad config
+/// stops once instead of restarting forever.
+pub const EXIT_CONFIG: i32 = 78;
 
 enum Command {
     Daemon,
@@ -177,14 +182,14 @@ fn main() {
         _ => {}
     }
 
-    // Remaining commands need location
-    let loc = match config::load_location(&paths) {
-        Some(loc) => loc,
-        None => {
-            eprintln!("No location configured. Use --set-location first.");
-            eprintln!("  Example: abraxas --set-location 60614");
-            eprintln!("  Example: abraxas --set-location 41.88,-87.63");
-            process::exit(1);
+    // Remaining commands need location; the first run writes the config.
+    let loc = match config::load_or_create_location(&paths) {
+        Ok(loc) => loc,
+        Err(e) => {
+            eprintln!("[fatal] config: {}", e);
+            eprintln!("  Fix it, or run: abraxas --set-location 60614");
+            eprintln!("              or: abraxas --set-location 41.88,-87.63");
+            process::exit(EXIT_CONFIG);
         }
     };
 
@@ -319,8 +324,8 @@ fn cmd_set_location(loc_str: &str, paths: &config::Paths) -> i32 {
             }
         };
 
-        if config::save_location(paths, lat, lon).is_err() {
-            eprintln!("Failed to save config");
+        if let Err(e) = config::save_location(paths, lat, lon) {
+            eprintln!("Failed to save config: {e}");
             return 1;
         }
         println!("Location set to: {:.4}, {:.4}", lat, lon);
@@ -337,8 +342,8 @@ fn cmd_set_location(loc_str: &str, paths: &config::Paths) -> i32 {
     match zipdb::lookup(&paths.zipdb_file, loc_str) {
         Some((lat, lon)) => {
             println!("Found: {} -> {:.4}, {:.4}", loc_str, lat, lon);
-            if config::save_location(paths, lat as f64, lon as f64).is_err() {
-                eprintln!("Failed to save config");
+            if let Err(e) = config::save_location(paths, lat as f64, lon as f64) {
+                eprintln!("Failed to save config: {e}");
                 return 1;
             }
             println!("Location set to: {:.4}, {:.4}", lat, lon);
@@ -448,7 +453,7 @@ fn cmd_benchmark(paths: &config::Paths) {
         elapsed / 1000, elapsed / N, N);
 
     // Get location for solar calcs
-    let loc = config::load_location(paths);
+    let loc = config::load_location(paths).ok();
     let (lat, lon) = loc.map(|l| (l.lat, l.lon)).unwrap_or((41.88, -87.63));
     let now = now_epoch();
 
@@ -528,10 +533,6 @@ fn cmd_benchmark(paths: &config::Paths) {
 }
 
 // Time helpers
-
-pub fn now_epoch() -> i64 {
-    unsafe { libc::time(std::ptr::null_mut()) as i64 }
-}
 
 fn chrono_now() -> i64 {
     now_epoch()

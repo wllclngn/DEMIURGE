@@ -38,6 +38,48 @@ INSTALL_BINARY = _real_home / ".local" / "bin" / "abraxas"
 INSTALL_CONFIG_DIR = _real_home / ".config" / "abraxas"
 INSTALL_SERVICE = _real_home / ".config" / "systemd" / "user" / "abraxas.service"
 
+# Cargo target directory. ABRAXAS/rust is a member of the DEMIURGE
+# workspace, so a bare `cargo build` there writes to the workspace root's
+# target/, not rust/target/ -- which is why this has to be pinned rather
+# than assumed. --target-dir points it at the orchestrator's shared build
+# so the dependency graph is compiled once for the whole install.
+BUILD_DIR = Path("/tmp/abraxas-build")
+
+
+def retarget(name: str | None, target_dir: str | None) -> bool:
+    """Rebind the install paths to an explicitly named account, and the
+    build to a shared target directory. --user matters inside an
+    arch-chroot, where $SUDO_USER doesn't exist and $HOME is /root."""
+    global _real_user, _real_home, INSTALL_BINARY, INSTALL_CONFIG_DIR
+    global INSTALL_SERVICE, BUILD_DIR
+
+    if target_dir:
+        BUILD_DIR = Path(target_dir)
+    if not name:
+        return True
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        log_error(f"No such user: {name}")
+        return False
+    _real_user = pw.pw_name
+    _real_home = Path(pw.pw_dir)
+    INSTALL_BINARY = _real_home / ".local" / "bin" / "abraxas"
+    INSTALL_CONFIG_DIR = _real_home / ".config" / "abraxas"
+    INSTALL_SERVICE = _real_home / ".config" / "systemd" / "user" / "abraxas.service"
+    return True
+
+
+def chown_to_real_user(path: Path) -> None:
+    """Hand a file we wrote as root to the account that will use it."""
+    if os.geteuid() != 0:
+        return
+    try:
+        pw = pwd.getpwnam(_real_user)
+        os.chown(path, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError) as e:
+        log_warn(f"chown {path}: {e}")
+
 
 
 # =============================================================================
@@ -80,9 +122,20 @@ def run_cmd_capture(cmd: list, cwd: Path | None = None) -> tuple[int, str, str]:
 
 def get_systemctl_cmd() -> list:
     """Get base systemctl command, handling sudo user context."""
-    if os.environ.get("SUDO_USER"):
-        return ["systemctl", f"--machine={os.environ['SUDO_USER']}@.host", "--user"]
+    if os.geteuid() == 0:
+        return ["systemctl", f"--machine={_real_user}@.host", "--user"]
     return ["systemctl", "--user"]
+
+
+def user_manager_running() -> bool:
+    """Whether _real_user has a systemd user manager to talk to. There
+    isn't one inside an arch-chroot, and every systemctl --user call
+    there is a slow guaranteed failure."""
+    try:
+        uid = pwd.getpwnam(_real_user).pw_uid
+    except KeyError:
+        return False
+    return Path(f"/run/user/{uid}/bus").exists()
 
 
 # =============================================================================
@@ -101,6 +154,8 @@ def check_x11_libs() -> bool:
 
 def is_service_enabled() -> bool:
     """Check if abraxas systemd service is enabled."""
+    if not user_manager_running():
+        return False
     cmd = get_systemctl_cmd() + ["is-enabled", "abraxas.service"]
     ret, _, _ = run_cmd_capture(cmd)
     return ret == 0
@@ -108,6 +163,8 @@ def is_service_enabled() -> bool:
 
 def is_service_active() -> bool:
     """Check if abraxas systemd service is running."""
+    if not user_manager_running():
+        return False
     cmd = get_systemctl_cmd() + ["is-active", "abraxas.service"]
     ret, _, _ = run_cmd_capture(cmd)
     return ret == 0
@@ -115,6 +172,12 @@ def is_service_active() -> bool:
 
 def enable_service() -> bool:
     """Enable and start abraxas service."""
+    if not user_manager_running():
+        log_warn(f"No systemd user manager for {_real_user}; enable "
+                 "abraxas.service after first boot:")
+        log_warn("  systemctl --user enable --now abraxas.service")
+        return True
+
     log_info("Enabling abraxas service...")
 
     base_cmd = get_systemctl_cmd()
@@ -160,6 +223,10 @@ def stop_all_abraxas() -> None:
     Prevents duplicate daemons: the old process must be fully dead before
     a new binary is installed and the service restarted.
     """
+    if not user_manager_running():
+        # Nothing is running on a machine that isn't booted yet.
+        return
+
     base_cmd = get_systemctl_cmd()
 
     # Stop the service (5s timeout -- old binaries may not respond to SIGTERM)
@@ -198,53 +265,6 @@ def restart_service() -> bool:
 # =============================================================================
 # BUILD
 # =============================================================================
-
-def build_abraxas_c23(source_dir: Path, force: bool = False,
-                      non_usa: bool = False) -> bool:
-    """Build abraxas C23 binary (statically links libmeridian)."""
-    c23_dir = source_dir / "c23"
-    binary = c23_dir / "abraxas"
-
-    # Skip build if already exists (unless forced)
-    if binary.exists() and not force:
-        log_info("abraxas (C23) already built (use --rebuild to force)")
-        return True
-
-    if non_usa:
-        log_info("BUILDING ABRAXAS [C23] (non-USA: weather disabled)")
-    else:
-        log_info("BUILDING ABRAXAS [C23]")
-
-    # Check for make
-    ret, _, _ = run_cmd_capture(["which", "make"])
-    if ret != 0:
-        log_error("make not found. Install build tools: sudo pacman -S base-devel")
-        return False
-
-    # Check for gcc
-    ret, _, _ = run_cmd_capture(["which", "gcc"])
-    if ret != 0:
-        log_error("gcc not found. Install build tools: sudo pacman -S base-devel")
-        return False
-
-    # Build (top-level make builds libmeridian.a then daemon)
-    make_cmd = ["make", "-C", str(c23_dir)]
-    if non_usa:
-        make_cmd.append("NOAA=0")
-    ret = run_cmd(make_cmd + ["clean"])
-    ret = run_cmd(make_cmd)
-
-    if ret != 0:
-        log_error("C23 build failed!")
-        return False
-
-    if not binary.exists():
-        log_error("Build completed but abraxas binary not found")
-        return False
-
-    log_info(f"Built: {binary}")
-    return True
-
 
 def build_abraxas_rust(source_dir: Path, non_usa: bool = False) -> bool:
     """Build abraxas via cargo."""
@@ -296,19 +316,26 @@ def build_abraxas_rust(source_dir: Path, non_usa: bool = False) -> bool:
     if features:
         cargo_cmd.extend(["--features", ",".join(features)])
 
-    ret = run_cmd(cargo_cmd, cwd=rust_dir)
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(BUILD_DIR)
+    print(f">>> CARGO_TARGET_DIR={BUILD_DIR} {' '.join(cargo_cmd)}")
+    result = subprocess.run(cargo_cmd, cwd=rust_dir, env=env)
 
-    if ret != 0:
+    if result.returncode != 0:
         log_error("Rust build failed!")
         return False
 
-    binary = rust_dir / "target" / "release" / "abraxas"
+    binary = abraxas_binary()
     if not binary.exists():
         log_error("Build completed but binary not found")
         return False
 
     log_info(f"Built: {binary}")
     return True
+
+
+def abraxas_binary() -> Path:
+    return BUILD_DIR / "release" / "abraxas"
 
 
 # =============================================================================
@@ -322,15 +349,17 @@ def cmd_install(args, source_dir: Path) -> bool:
     source_service = source_dir / "abraxas.service"
     source_zipdb = source_dir / "us_zipcodes.bin"
 
-    # Rust is the only implementation path now. The C23 source tree
-    # under c23/ is preserved (build_abraxas_c23 still defined) but
-    # the install path no longer offers it -- DEMIURGE is monoculture-
-    # Rust. Restoring the C23 install path is a contained change to
-    # this function plus the argparse table at the bottom.
+    # ABRAXAS is Rust-only. The C23 implementation that shipped
+    # alongside through v0.7 is gone as of v0.8.0 -- the audit
+    # confirmed feature parity, the install path was already Rust,
+    # and the c23/ source tree was deleted to drop ~6900 LOC of
+    # dead weight from the repo.
 
     # Determine NOAA mode: --non-usa flag overrides, otherwise prompt
     if args.non_usa:
         non_usa = True
+    elif args.yes:
+        non_usa = False
     else:
         print()
         try:
@@ -354,14 +383,15 @@ def cmd_install(args, source_dir: Path) -> bool:
 
     if not build_abraxas_rust(source_dir, non_usa=non_usa):
         return False
-    source_binary = source_dir / "rust" / "target" / "release" / "abraxas"
+    source_binary = abraxas_binary()
 
     # Create directories
     log_info("Creating directories...")
     try:
-        INSTALL_BINARY.parent.mkdir(parents=True, exist_ok=True)
-        INSTALL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        INSTALL_SERVICE.parent.mkdir(parents=True, exist_ok=True)
+        for d in (INSTALL_BINARY.parent, INSTALL_CONFIG_DIR,
+                  INSTALL_SERVICE.parent):
+            d.mkdir(parents=True, exist_ok=True)
+            chown_to_real_user(d)
     except OSError as e:
         log_error(f"Failed to create directories: {e}")
         return False
@@ -404,23 +434,14 @@ def cmd_install(args, source_dir: Path) -> bool:
     else:
         log_warn("Systemd service file not found in source")
 
-    # Fix ownership if running as root
-    if os.environ.get("SUDO_USER"):
-        try:
-            pw = pwd.getpwnam(_real_user)
-            uid, gid = pw.pw_uid, pw.pw_gid
-
-            os.chown(INSTALL_BINARY, uid, gid)
-            wl_dest = INSTALL_BINARY.parent / "meridian_wl.so"
-            if wl_dest.exists():
-                os.chown(wl_dest, uid, gid)
-            if INSTALL_SERVICE.exists():
-                os.chown(INSTALL_SERVICE, uid, gid)
-
-            for f in INSTALL_CONFIG_DIR.iterdir():
-                os.chown(f, uid, gid)
-        except (KeyError, OSError) as e:
-            log_warn(f"Failed to fix ownership: {e}")
+    chown_to_real_user(INSTALL_BINARY)
+    wl_dest = INSTALL_BINARY.parent / "meridian_wl.so"
+    if wl_dest.exists():
+        chown_to_real_user(wl_dest)
+    if INSTALL_SERVICE.exists():
+        chown_to_real_user(INSTALL_SERVICE)
+    for f in INSTALL_CONFIG_DIR.iterdir():
+        chown_to_real_user(f)
 
     print()
     log_info("SUCCESS. Installation complete.")
@@ -429,10 +450,16 @@ def cmd_install(args, source_dir: Path) -> bool:
     # Offer to enable service
     if not args.no_service and INSTALL_SERVICE.exists():
         if not is_service_enabled():
-            print()
-            response = input("Enable abraxas service? [Y/N]: ").strip().lower()
-            if response in ("", "y", "yes"):
+            if args.yes:
                 enable_service()
+            else:
+                print()
+                try:
+                    response = input("Enable abraxas service? [Y/N]: ").strip().lower()
+                    if response in ("", "y", "yes"):
+                        enable_service()
+                except EOFError:
+                    print()
         else:
             # Restart if already running
             restart_service()
@@ -510,12 +537,9 @@ def cmd_status(args, source_dir: Path) -> bool:
     print(f"  X11 fallback: {'available' if x11_ok else 'not available (install libx11 libxrandr)'}")
     print()
 
-    # Implementation is fixed at Rust now; the impl_file marker may
-    # still exist on systems upgraded from a C23-era install but is
-    # no longer authoritative. Show binary size for sanity instead.
     if binary_ok:
         size = INSTALL_BINARY.stat().st_size
-        print(f"  Language: RUST ({size // 1024} KB)")
+        print(f"  Binary: {size // 1024} KB")
         print()
 
     print(f"  Overall: {'INSTALLED' if binary_ok else 'NOT INSTALLED'}")
@@ -537,55 +561,9 @@ def cmd_disable(args, source_dir: Path) -> bool:
     return disable_service()
 
 
-def cmd_test(args, source_dir: Path) -> bool:
-    """Show implementation comparison table."""
-    print()
-    print("  ════════════════════════════════════════════════════════════")
-    print("                  MAIN EVENT: C23 vs. Rust")
-    print("  ════════════════════════════════════════════════════════════")
-    print("  ┌──────────────────┬───────────────────┬───────────────────┐")
-    print("  │                  │ C23               │ Rust              │")
-    print("  ├──────────────────┼───────────────────┼───────────────────┤")
-    print("  │ Compiler         │ GCC 15 (-std=c2x) │ rustc 1.75+       │")
-    print("  │ Binary size      │ ~69 KB            │ ~598 KB           │")
-    print("  │ Shared libs      │ 3                 │ 4                 │")
-    print("  │ Memory model     │ manual alloc/free │ ownership/borrow  │")
-    print("  │ Gamma: DRM       │ raw ioctl         │ raw ioctl         │")
-    print("  │ Gamma: Wayland   │ dlopen plugin     │ wayland-client    │")
-    print("  │ Gamma: X11       │ dlopen            │ x11rb             │")
-    print("  │ Gamma: GNOME     │ dlopen sd-bus     │ libsystemd/sd-bus │")
-    print("  │ Weather          │ curl(1) via spawn │ curl(1) via spawn │")
-    print("  │ Config parse     │ hand-rolled JSON  │ serde_json        │")
-    print("  │ Event loop       │ io_uring          │ io_uring          │")
-    print("  │ Sandbox          │ seccomp + landlock │ seccomp + landlock│")
-    print("  │ Hardening        │ prctl             │ prctl             │")
-    print("  │ LTO              │ yes (-flto=auto)  │ yes (cargo)       │")
-    print("  │ Static build     │ make static (musl)│ musl static-pie   │")
-    print("  └──────────────────┴───────────────────┴───────────────────┘")
-
-    # Show actual binary sizes if built
-    c23_bin = source_dir / "c23" / "abraxas"
-    rust_bin = source_dir / "rust" / "target" / "release" / "abraxas"
-    print()
-    if c23_bin.exists():
-        size = c23_bin.stat().st_size
-        log_info(f"C23 binary:  {c23_bin} ({size // 1024} KB)")
-    else:
-        log_info("C23 binary:  not built")
-    if rust_bin.exists():
-        size = rust_bin.stat().st_size
-        log_info(f"Rust binary: {rust_bin} ({size // 1024} KB)")
-    else:
-        log_info("Rust binary: not built")
-
-    print()
-    return True
-
-
 def cmd_update(args, source_dir: Path) -> bool:
     """Update abraxas if source is newer."""
     log_info("CHECKING FOR UPDATES")
-    log_info("Implementation: rust")
 
     needs_rebuild = False
 
@@ -613,7 +591,7 @@ def cmd_update(args, source_dir: Path) -> bool:
     non_usa = getattr(args, 'non_usa', False)
     if not build_abraxas_rust(source_dir, non_usa=non_usa):
         return False
-    source_binary = source_dir / "rust" / "target" / "release" / "abraxas"
+    source_binary = abraxas_binary()
 
     # Stop ALL running abraxas processes before overwriting binary
     log_info("Stopping existing abraxas processes...")
@@ -623,16 +601,10 @@ def cmd_update(args, source_dir: Path) -> bool:
     shutil.copy2(source_binary, INSTALL_BINARY)
     INSTALL_BINARY.chmod(0o755)
 
-    # Fix ownership if running as root
-    if os.environ.get("SUDO_USER"):
-        try:
-            pw = pwd.getpwnam(_real_user)
-            os.chown(INSTALL_BINARY, pw.pw_uid, pw.pw_gid)
-            wl_dest = INSTALL_BINARY.parent / "meridian_wl.so"
-            if wl_dest.exists():
-                os.chown(wl_dest, pw.pw_uid, pw.pw_gid)
-        except (KeyError, OSError) as e:
-            log_warn(f"Failed to fix ownership: {e}")
+    chown_to_real_user(INSTALL_BINARY)
+    wl_dest = INSTALL_BINARY.parent / "meridian_wl.so"
+    if wl_dest.exists():
+        chown_to_real_user(wl_dest)
 
     restart_service()
     log_info("Update complete")
@@ -656,13 +628,11 @@ Commands:
   enable      Enable systemd service
   disable     Disable systemd service
   update      Update if source is newer
-  test        Show C23 vs Rust comparison table
 
 Examples:
   ./install.py                    # Install (prompts for NOAA)
   ./install.py --no-service       # Install without prompting for service
   ./install.py --non-usa          # Install without NOAA weather support
-  ./install.py test               # Show implementation comparison
   ./install.py status             # Check installation status
   ./install.py enable             # Enable service
   ./install.py uninstall          # Remove installation
@@ -670,7 +640,7 @@ Examples:
     )
 
     parser.add_argument("command", nargs="?", default="install",
-                       choices=["install", "uninstall", "status", "enable", "disable", "update", "test"],
+                       choices=["install", "uninstall", "status", "enable", "disable", "update"],
                        help="Command to run (default: install)")
     parser.add_argument("--no-service", action="store_true",
                        help="Don't prompt to enable service after install")
@@ -678,25 +648,26 @@ Examples:
                        help="Force rebuild even if already built")
     parser.add_argument("--non-usa", action="store_true",
                        help="Disable NOAA weather support")
-    # --impl: accepted for backward compat, ignored. The C23 path is
-    # unwired; only the Rust implementation is built and installed.
-    parser.add_argument("--impl", dest="impl_choice", choices=["c23", "rust"],
-                       default=None,
-                       help=argparse.SUPPRESS)
-    parser.add_argument("--test", action="store_true",
-                       help="Show C23 vs Rust comparison table")
+    parser.add_argument("-y", "--yes", action="store_true",
+                       help="Assume yes to prompts (non-interactive installs)")
+    parser.add_argument("--user", metavar="NAME",
+                       help="Account whose $HOME receives the binary, config "
+                            "and user unit (default: $SUDO_USER, else you)")
+    parser.add_argument("--target-dir", metavar="DIR",
+                       help="Cargo target directory to build into. Point it "
+                            "at a shared workspace build to reuse its "
+                            "compiled dependencies.")
 
     args = parser.parse_args()
-
-    # --test flag overrides command
-    if args.test:
-        args.command = "test"
 
     source_dir = Path(__file__).parent.resolve()
 
     print()
     log_info("abraxas installer")
     log_info(f"Source: {source_dir}")
+
+    if not retarget(args.user, args.target_dir):
+        return 1
     print()
 
     # Run command
@@ -707,7 +678,6 @@ Examples:
         "enable": cmd_enable,
         "disable": cmd_disable,
         "update": cmd_update,
-        "test": cmd_test,
     }
 
     success = commands[args.command](args, source_dir)

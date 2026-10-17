@@ -15,19 +15,35 @@ path = "src/main.rs"
 name = "gordian_knot"
 path = "src/bin/gordian_knot.rs"
 
+[[bin]]
+name = "medusa"
+path = "src/bin/medusa.rs"
+
+[[bin]]
+name = "gnosis"
+path = "src/bin/gnosis.rs"
+
 [dependencies]
 demiurge-core = { path = "../core" }
-x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver", "xfixes", "dpms"] }
+x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver", "xfixes", "dpms", "shape", "xtest", "xinput"] }
 cairo-rs = { version = "0.20", features = ["png"] }
 pangocairo = "0.20"
 pango = "0.20"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 libc = "0.2"
 # D-Bus client for gordian_knot's inhibit-watcher (logind ListInhibitors).
 # zbus 4 with default async-io runtime (smol-based, tiny); we use its
 # blocking re-exports since gordian_knot's D-Bus calls are infrequent.
 zbus = "4"
+# Wayland client side for gordian_knot --wl mode (ext-session-lock-v1
+# locker). Versions match the workspace pin via demiurge-wl's
+# smithay transitive deps so cargo resolves to one build of each.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+xkbcommon = "0.8"
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

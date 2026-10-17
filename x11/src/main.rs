@@ -7,14 +7,17 @@ mod display;
 mod event;
 mod ewmh;
 mod idle;
+mod journal;
 mod keys;
 mod layout;
+mod modes;
 mod monitor;
 mod mouse;
 mod mru;
 mod spawn;
 mod torrentius;
 mod wm;
+mod xsettings;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::ConnectionExt as _;
@@ -23,6 +26,7 @@ use std::path::PathBuf;
 
 fn main() {
     let Args { config_path, check_config, setup } = parse_args();
+    journal::route_stderr_from_vt("demiurge");
 
     let paths = match config_path {
         Some(p) => config::Paths::with_config(p),
@@ -77,6 +81,14 @@ fn main() {
     for cmd in &cfg.startup.commands {
         eprintln!("[demiurge] startup: {}", cmd);
         spawn::spawn(cmd);
+    }
+
+    // Idle lock + lock-before-suspend, opted into by [input.idle]
+    // lock_seconds. A session child, so it starts with X under startx or
+    // greetd alike and is torn down with the session.
+    if cfg.input.idle.lock_seconds > 0 {
+        eprintln!("[demiurge] startup: gordian_knot --daemon (lock after {}s idle)", cfg.input.idle.lock_seconds);
+        spawn::spawn("gordian_knot --daemon");
     }
 
     // Tag-targeted spawns. Each registers a pending WM_CLASS match before

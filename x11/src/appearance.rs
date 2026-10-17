@@ -36,9 +36,29 @@ pub fn write_setup_files(config: &Config) -> Result<(), String> {
 
     write_icons_default(&home, &config.cursor.theme)?;
     write_gtk3_settings(&home, config)?;
+    write_gtk4_settings(&home, config)?;
     write_gtk2_settings(&home, config)?;
 
     Ok(())
+}
+
+// Shared GTK key=value set projected from [appearance] + [cursor] +
+// [font]. theme-name / icon-theme-name are only emitted when set in
+// [appearance] -- empty means "leave whatever the user / GTK default
+// is," so we don't blank a theme nobody configured here.
+fn gtk_updates(config: &Config) -> Vec<(&'static str, String)> {
+    let mut updates = vec![
+        ("gtk-font-name", config.font.default.clone()),
+        ("gtk-cursor-theme-name", config.cursor.theme.clone()),
+        ("gtk-cursor-theme-size", config.cursor.size.to_string()),
+    ];
+    if !config.appearance.gtk_theme.is_empty() {
+        updates.push(("gtk-theme-name", config.appearance.gtk_theme.clone()));
+    }
+    if !config.appearance.icon_theme.is_empty() {
+        updates.push(("gtk-icon-theme-name", config.appearance.icon_theme.clone()));
+    }
+    updates
 }
 
 // ~/.icons/default/index.theme: primary location libXcursor reads to
@@ -58,31 +78,45 @@ fn write_icons_default(home: &Path, cursor_theme: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ~/.config/gtk-3.0/settings.ini: GTK3 app font and cursor theme. Merge
-// onto existing file (preserves theme-name and other keys the user set).
+// ~/.config/gtk-3.0/settings.ini: GTK3 app font, cursor, theme, icon
+// theme. Merge onto existing file (preserves keys we don't touch).
 fn write_gtk3_settings(home: &Path, config: &Config) -> Result<(), String> {
     let dir = home.join(".config").join("gtk-3.0");
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
     let path = dir.join("settings.ini");
-
-    let updates = [
-        ("gtk-font-name", config.font.default.clone()),
-        ("gtk-cursor-theme-name", config.cursor.theme.clone()),
-        ("gtk-cursor-theme-size", config.cursor.size.to_string()),
-    ];
-    merge_gtk_settings(&path, &updates)?;
+    merge_gtk_settings(&path, &gtk_updates(config))?;
     eprintln!("[demiurge setup] wrote {}", path.display());
     Ok(())
 }
 
-// ~/.gtkrc-2.0: GTK2 app font and cursor theme. Mostly legacy but still
-// read by a few apps. Cheap to emit.
+// ~/.config/gtk-4.0/settings.ini: GTK4 apps. Same key set as GTK3.
+// Created if the directory doesn't exist -- GTK4 apps are common now.
+fn write_gtk4_settings(home: &Path, config: &Config) -> Result<(), String> {
+    let dir = home.join(".config").join("gtk-4.0");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+    let path = dir.join("settings.ini");
+    merge_gtk_settings(&path, &gtk_updates(config))?;
+    eprintln!("[demiurge setup] wrote {}", path.display());
+    Ok(())
+}
+
+// ~/.gtkrc-2.0: GTK2 app font, cursor, theme, icon theme. Mostly legacy
+// but still read by a few apps. Cheap to emit.
 fn write_gtk2_settings(home: &Path, config: &Config) -> Result<(), String> {
     let path = home.join(".gtkrc-2.0");
-    let contents = format!(
+    let mut contents = format!(
         "gtk-font-name=\"{}\"\ngtk-cursor-theme-name=\"{}\"\ngtk-cursor-theme-size={}\n",
         config.font.default, config.cursor.theme, config.cursor.size
     );
+    if !config.appearance.gtk_theme.is_empty() {
+        contents.push_str(&format!("gtk-theme-name=\"{}\"\n", config.appearance.gtk_theme));
+    }
+    if !config.appearance.icon_theme.is_empty() {
+        contents.push_str(&format!(
+            "gtk-icon-theme-name=\"{}\"\n",
+            config.appearance.icon_theme
+        ));
+    }
     atomic_write(&path, contents.as_bytes())?;
     eprintln!("[demiurge setup] wrote {}", path.display());
     Ok(())

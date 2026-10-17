@@ -45,6 +45,48 @@ pub struct Config {
     #[allow(dead_code)]
     #[serde(default)]
     pub gordian_knot: GordianKnot,
+    #[serde(default)]
+    pub appearance: Appearance,
+}
+
+// [appearance] -- the single source of truth for the desktop's visual
+// identity. Two delivery mechanisms consume it:
+//   (a) native -- DEMIURGE's own surfaces (bar focus highlight, the
+//       GORDIAN KNOT lock/login accent, MEDUSA's selection border)
+//       read `accent` directly. Change one value, the whole desktop
+//       moves together.
+//   (b) projected -- `demiurge --setup` writes gtk_theme + icon_theme
+//       into the GTK config files so external GTK / Qt apps match.
+//       (cursor theme + font still live in [cursor] / [font] and are
+//       projected by the same pass; folding them under [appearance]
+//       is a later consolidation.)
+//
+// The XSETTINGS live-update path (re-theme running apps without a
+// restart, dropping the xsettingsd dependency) is a follow-on.
+#[derive(Debug, Deserialize)]
+pub struct Appearance {
+    // The shared highlight colour, "#RRGGBB". Bar focused tag, lock /
+    // login accent, MEDUSA selection border all default to this.
+    #[serde(default = "default_appearance_accent")]
+    pub accent: String,
+    // GTK widget theme name, projected to ~/.gtkrc-2.0 +
+    // gtk-{3,4}.0/settings.ini for external apps. DEMIURGE's own
+    // surfaces never need it -- they draw native.
+    #[serde(default)]
+    pub gtk_theme: String,
+    // Icon theme name, projected the same way.
+    #[serde(default)]
+    pub icon_theme: String,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            accent: default_appearance_accent(),
+            gtk_theme: String::new(),
+            icon_theme: String::new(),
+        }
+    }
 }
 
 // Per-output display configuration. Each entry matches an output by
@@ -179,6 +221,15 @@ pub struct GordianKnot {
     pub idle_timeout_seconds: u64,
     #[serde(default = "default_gk_prompt")]
     pub prompt: String,
+    // --login only: what greetd is asked to exec on a successful auth,
+    // and the environment it starts with. The default is the X11
+    // daily-driver; a Wayland session sets
+    //   session_cmd = ["/usr/local/bin/demiurge-wl-tty"]
+    //   session_env = ["XDG_SESSION_TYPE=wayland"]
+    #[serde(default = "default_gk_session_cmd")]
+    pub session_cmd: Vec<String>,
+    #[serde(default = "default_gk_session_env")]
+    pub session_env: Vec<String>,
 }
 
 impl Default for GordianKnot {
@@ -190,6 +241,8 @@ impl Default for GordianKnot {
             font: default_gk_font(),
             idle_timeout_seconds: default_gk_idle_timeout(),
             prompt: default_gk_prompt(),
+            session_cmd: default_gk_session_cmd(),
+            session_env: default_gk_session_env(),
         }
     }
 }
@@ -401,8 +454,11 @@ fn default_bar_fg() -> String {
 fn default_clock_format() -> String {
     "%a %b %d %Y   %I:%M:%S %p %Z".into()
 }
+// Empty = inherit [appearance].accent. The bar resolves the fallback
+// at color-build time. A user who wants the focused-tag highlight to
+// differ from the shared accent sets this explicitly.
 fn default_tag_focused_bg() -> String {
-    "#4A4881".into()
+    String::new()
 }
 fn default_tag_focused_fg() -> String {
     "#ffffff".into()
@@ -440,7 +496,16 @@ fn default_gk_bg() -> String {
 fn default_gk_fg() -> String {
     "#c8c8c8".into()
 }
+// Empty = inherit [appearance].accent. The gordian_knot binary
+// resolves the fallback right after loading config. Set explicitly to
+// give the lock / login a different accent from the rest of the desktop.
 fn default_gk_accent() -> String {
+    String::new()
+}
+// DEMIURGE amber -- the shared accent fallback. Everything that
+// inherits the accent (bar focus, lock / login, MEDUSA selection)
+// lands here when nothing overrides.
+fn default_appearance_accent() -> String {
     "#e5a93d".into()
 }
 fn default_gk_font() -> String {
@@ -451,6 +516,18 @@ fn default_gk_idle_timeout() -> u64 {
 }
 fn default_gk_prompt() -> String {
     "PASSWORD".into()
+}
+
+fn default_gk_session_cmd() -> Vec<String> {
+    vec!["startx".into(), "/usr/local/bin/demiurge".into()]
+}
+
+// OZONE_PLATFORM rides along here because the greetd path never touches
+// the xsessions entry or the demiurge.service user unit that otherwise
+// carry it -- without this, Chromium / Electron children launched from a
+// greetd login try Wayland and exit.
+fn default_gk_session_env() -> Vec<String> {
+    vec!["XDG_SESSION_TYPE=x11".into(), "OZONE_PLATFORM=x11".into()]
 }
 
 pub fn load(paths: &Paths) -> Result<Config, String> {

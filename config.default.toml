@@ -1,8 +1,18 @@
 [general]
 tags = ["X", "Y", "Z"]
 default_layout = "floating"
-border_width = 0
-focus_model = "click"
+
+# [appearance]: the single source of truth for the desktop accent +
+# (projected) GTK theme / icon theme. The accent is read NATIVELY by
+# every DEMIURGE surface -- bar focused tag, GORDIAN KNOT lock / login,
+# MEDUSA selection -- so changing this one value moves the whole desktop
+# together. gtk_theme / icon_theme are projected into ~/.gtkrc-2.0 +
+# gtk-{3,4}.0/settings.ini by `demiurge --setup` for external GTK apps;
+# leave empty to not touch them.
+[appearance]
+accent = "#4A4881"
+gtk_theme = ""
+icon_theme = ""
 
 [bar]
 height = 40
@@ -10,7 +20,8 @@ font = "Noto Sans 9"
 bg = "#121212"
 fg = "#888888"
 clock_format = "%a %b %d %Y   %I:%M:%S %p %Z"
-tag_focused_bg = "#4A4881"
+# tag_focused_bg left unset -> inherits [appearance].accent. Set it to
+# give the focused-tag highlight a colour different from the accent.
 tag_focused_fg = "#ffffff"
 tag_occupied_fg = "#888888"
 tag_empty_fg = "#555555"
@@ -18,18 +29,79 @@ tag_empty_fg = "#555555"
 # lxappearance replacement: cursor theme + default font. `demiurge --setup`
 # writes the equivalent lxappearance files (GTK settings, icons/default)
 # from these values. XCURSOR_THEME and XCURSOR_SIZE are exported at WM init.
+#
+# auto_hide: when true, the cursor hides after auto_hide_seconds of
+# pointer stillness and reappears the moment the user moves the mouse.
+# Force-shown during Super+drag. Set to true for a keyboard-forward
+# session (cursor invisible while you type).
 [cursor]
 theme = "default"
 size = 24
+auto_hide = false
+auto_hide_seconds = 5
 
 [font]
 default = "Noto Sans 9"
 
+# Keyboard auto-repeat: DEMIURGE owns this surface (replaces
+# `xset r rate ...` from startup.commands). Both fields default to
+# 0 = "leave server default in place". Set both to non-zero to take
+# over; values are re-applied on every MappingNotify so USB hot-plug
+# and layout switches don't silently revert them.
+#
+# layout / variant / options: XKB layout selection. Empty = leave
+# server default. options is a free-form pass-through (caps:escape,
+# ctrl:nocaps, compose:menu, etc.).
+[input.keyboard]
+repeat_delay = 0
+repeat_rate = 0
+layout = ""
+variant = ""
+options = []
+
+# Idle / power-save / lock thresholds. All values in seconds.
+# 0 = "leave server default in place". GORDIAN KNOT's idle daemon
+# reads lock_seconds from here.
+[input.idle]
+lock_seconds = 0
+screensaver_seconds = 0
+dpms_standby_seconds = 0
+dpms_suspend_seconds = 0
+dpms_off_seconds = 0
+
+# X11 audible bell. All fields are optional (None = leave default).
+# Most keyboard-forward setups want enabled = false. Uncomment to take
+# over.
+# [input.bell]
+# enabled = false
+
+# GORDIAN KNOT. Colors and font fall back to [appearance]; the two
+# session_* keys are read only by `gordian_knot --login` (the greetd
+# greeter) and decide what greetd execs after a successful auth. The
+# defaults below are the X11 daily-driver; uncomment and swap for the
+# Wayland session.
+#
+# [gordian_knot]
+# session_cmd = ["startx", "/usr/local/bin/demiurge"]
+# session_env = ["XDG_SESSION_TYPE=x11", "OZONE_PLATFORM=x11"]
+#
+#   Wayland instead:
+# session_cmd = ["/usr/local/bin/demiurge-wl-tty"]
+# session_env = ["XDG_SESSION_TYPE=wayland"]
+
+# Per-output display config (mode / DSR / DPI). Match by connector
+# name (`xrandr` to discover) or EDID model substring. Uncomment and
+# fill in for your hardware. Replaces xrandr -s / --dpi from
+# startup.commands.
+#
+# [[display]]
+# match = "HDMI-0"
+# mode = "2560x1440"
+# dpi = 138
+# dsr_multiplier = 1.0   # 2.0 = render at 4x pixels, downscale (DSR)
+
 [startup]
 commands = [
-    "xset r rate 185 30",
-    "xrandr -s 2560x1440",
-    "xrandr --dpi 138",
     "xrdb -merge ~/.Xresources",
     "cherrypie",
 ]
@@ -62,12 +134,11 @@ mods = ["Alt", "Shift"]
 key = "F4"
 action = "quit"
 
-# Lock screen
+# Lock screen (DEMIURGE ships GORDIAN KNOT as the locker)
 [[keybind]]
 mods = ["Super"]
 key = "Escape"
-action = "spawn"
-args = "physlock"
+action = "lock"
 
 # Tag navigation
 [[keybind]]
@@ -170,23 +241,23 @@ mods = ["Super"]
 key = "r"
 action = "run_prompt"
 
-# Screenshot
+# Screenshot (MEDUSA -- DEMIURGE's own capture utility)
 [[keybind]]
 key = "F12"
 action = "spawn"
-args = "flameshot gui -p $HOME"
+args = "medusa gui -p $HOME"
 
 [[keybind]]
 mods = ["Shift"]
 key = "F12"
 action = "spawn"
-args = "flameshot full -p $HOME"
+args = "medusa full -p $HOME"
 
 # Screenshot (Print Screen)
 [[keybind]]
 key = "Print"
 action = "spawn"
-args = "flameshot gui -p $HOME"
+args = "medusa gui -p $HOME"
 
 # Volume (PipeWire/WirePlumber via wpctl; fires bar notification)
 [[keybind]]

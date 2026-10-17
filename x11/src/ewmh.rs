@@ -30,6 +30,7 @@ pub fn set_supported(conn: &RustConnection, root: Window, atoms: &Atoms) {
         atoms._NET_WM_STATE_ABOVE,
         atoms._NET_WM_STATE_BELOW,
         atoms._NET_WM_STATE_HIDDEN,
+        atoms._NET_WM_STATE_DEMANDS_ATTENTION,
         atoms._NET_WM_WINDOW_TYPE,
         atoms._NET_FRAME_EXTENTS,
         atoms._NET_WM_STRUT_PARTIAL,

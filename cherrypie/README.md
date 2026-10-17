@@ -11,13 +11,16 @@ Replaces devilspie and devilspie2 with a simpler, faster alternative: TOML confi
 - Match windows by WM_CLASS, title, role, process name, or window type
 - Regex patterns on all matchers (case-insensitive, anchored, etc.)
 - Position windows: absolute coordinates, named anchors (`center`, `top-right`), or percentages
-- Size windows: absolute pixels or percentage of monitor
+- Size windows: absolute pixels or percentage of the monitor's work area
 - Target specific monitors by name or index
 - EWMH actions: maximize, fullscreen, pin (sticky), minimize, shade, above/below, focus, opacity, decoration toggle
 - Workspace assignment
 - Hot config reload on save (inotify `IN_CLOSE_WRITE`)
 - X11 via x11rb (pure Rust)
-- RandR monitor detection
+- RandR monitor detection, followed live through mode changes and hot-plug
+- Positions and percentages resolve against the work area (`_NET_WORKAREA`),
+  so a centered window sits below the window manager's bar
+- Fullscreen windows keep their own geometry; no rule moves or resizes them
 - Handles reparenting WMs (AwesomeWM, i3, etc.) via `_NET_CLIENT_LIST` diffing
 - Applies rules to existing windows on startup
 - poll(2) event loop with signalfd for clean shutdown
@@ -49,6 +52,7 @@ Binary: `/tmp/cherrypie-build/release/cherrypie`
 ```
 cherrypie                         # Run with default config
 cherrypie --config /path/to.toml  # Custom config path
+cherrypie --learn-after 30        # Seconds a window must stay open to be learned
 cherrypie --dry-run               # Log matches without applying actions
 cherrypie --version               # Print version
 ```
@@ -58,6 +62,33 @@ Default config location: `~/.config/cherrypie/config.toml`
 ## Configuration
 
 Rules are TOML tables. Each rule has matchers (at least one required) and actions.
+
+### Learned rules
+
+The config does not have to exist. cherrypie starts with no rules, and the
+first time a normal window maps whose class no rule matches, it applies live
+default actions to it at once. If a window of that class is still open 30
+seconds later (`--learn-after`), it appends the rule for the class:
+
+```toml
+# Learned 2026-10-16 from a new window; edit to taste.
+[[rule]]
+class = '^Gimp$'
+position = "center"
+size = ["60%", "70%"]
+focus = true
+```
+
+Edit the values and save; the file hot-reloads. The class matcher is the
+exact WM_CLASS, regex-escaped and anchored. One rule per class: A second
+window of the class matches the rule rather than learning another.
+Dialogs, transient windows and every other non-`normal` type are never
+learned, and neither are untitled windows, fullscreen windows (games) or
+classes whose windows all close inside the interval (installers, consoles
+and launch helpers). The rule is appended as text, so comments and ordering in the
+rest of the file are untouched. A config that exists but does not parse
+stops the daemon with status 78 (EX_CONFIG), which `cherrypie.service`
+excludes from its restart policy.
 
 ### Matchers
 
@@ -126,9 +157,10 @@ maximize = true
 
 ```
 src/
-  main.rs       Hand-rolled CLI (--config, --dry-run, --version, --help)
+  main.rs       Hand-rolled CLI (--config, --learn-after, --dry-run, --version, --help)
   daemon.rs     poll(2) event loop: signalfd + inotify + X11 fd
   config.rs     TOML parsing with serde untagged enums for flexible value types
+  learn.rs      Learned-rule text, compile-from-text, append to the config
   rules.rs      Rule compilation: regex, position/size/monitor resolution
   backend/
     mod.rs      Backend enum dispatch (feature-gated)
@@ -155,7 +187,13 @@ Build:
 CARGO_TARGET_DIR=/tmp/cherrypie-build cargo test --release
 ```
 
-43 tests: 21 config parsing, 22 rule compilation and matching. Tests live in `tests/` (external test crates).
+54 tests: 22 config parsing, 22 rule compilation and matching, 5 rule
+learning, and 5 end-to-end runs of the binary against a headless Xvfb
+(learning, placement, one rule per class, transients, untitled, short-lived
+and fullscreen windows skipped, work-area placement, and a live mode change
+through a resizeable Xephyr nested in Xvfb). Tests live in `tests/`
+(external test crates); they need `xorg-server-xvfb`, `xorg-server-xephyr`
+and `xorg-xrandr`.
 
 ## License
 

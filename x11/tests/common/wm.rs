@@ -16,6 +16,7 @@
 
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -29,6 +30,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct WmTest {
     pub display: String,
+    // The private Xvfb a resizeable Xephyr runs inside (new_resizeable).
+    host: Option<Child>,
     xephyr: Child,
     demiurge: Option<Child>,
     config_dir: Option<PathBuf>,
@@ -62,32 +65,25 @@ impl WmTest {
     /// start demiurge -- callers do that via start_demiurge so the test
     /// can write a per-test config first.
     pub fn new() -> Self {
-        // Pipe Xephyr's chosen display number back to us. Xephyr writes
-        // ASCII digits + '\n' to the write end and closes it; we read
-        // from our end of the pipe.
-        let (read_fd, write_fd) = make_pipe();
+        Self::start(None)
+    }
 
-        let xephyr = Command::new("Xephyr")
-            .args([
-                "-screen", "1280x720",
-                "-noreset",
-                "-ac", // disable host-based access control
-                "-displayfd", &write_fd.as_raw_fd().to_string(),
-            ])
-            // Xephyr inherits write_fd. The fd's CLOEXEC is unset by
-            // make_pipe so it survives the exec().
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn Xephyr -- is Xephyr installed? (pacman -S xorg-server-xephyr)");
+    /// A resizeable Xephyr inside its own Xvfb: RandR mode changes work
+    /// (xrandr -s), and no window manager on the user's display can
+    /// resize the Xephyr window under the test.
+    pub fn new_resizeable() -> Self {
+        let (host, display) = spawn_server("Xvfb", &["-screen", "0", "1920x1200x24", "-nolisten", "tcp"], None);
+        let mut t = Self::start(Some(&display));
+        t.host = Some(host);
+        t
+    }
 
-        // Drop the parent's write end so the read returns EOF when
-        // Xephyr closes its copy.
-        drop(write_fd);
-
-        let display_num = read_displayfd(read_fd, STARTUP_TIMEOUT)
-            .expect("Xephyr did not report a display number within timeout");
-        let display = format!(":{}", display_num);
+    fn start(host_display: Option<&str>) -> Self {
+        let mut args = vec!["-screen", "1280x720", "-noreset", "-ac"];
+        if host_display.is_some() {
+            args.push("-resizeable");
+        }
+        let (xephyr, display) = spawn_server("Xephyr", &args, host_display);
 
         // Connect to the new server. Xephyr may need a moment between
         // writing -displayfd and accepting connections; poll-with-timeout.
@@ -98,6 +94,7 @@ impl WmTest {
 
         Self {
             display,
+            host: None,
             xephyr,
             demiurge: None,
             config_dir: None,
@@ -131,13 +128,23 @@ impl WmTest {
             .env_remove("XCURSOR_THEME")
             .env_remove("XCURSOR_SIZE")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // DEMIURGE_TEST_STDERR=1 passes the WM's log through for a
+            // failing test (run it with --nocapture).
+            .stderr(if std::env::var_os("DEMIURGE_TEST_STDERR").is_some() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .expect("spawn demiurge");
         self.demiurge = Some(demiurge);
 
         wait_for_wm(&self.conn, self.root, &self.atoms, STARTUP_TIMEOUT)
             .expect("demiurge did not finish initializing within timeout");
+    }
+
+    pub fn demiurge_pid(&self) -> u32 {
+        self.demiurge.as_ref().expect("demiurge not started").id()
     }
 
     /// Create + map a basic InputOutput window on the test connection
@@ -321,6 +328,47 @@ impl WmTest {
     }
 }
 
+// Start an X server that reports its display through -displayfd, with
+// DISPLAY set to `host_display` for a nested server.
+fn spawn_server(bin: &str, args: &[&str], host_display: Option<&str>) -> (Child, String) {
+    // Pipe the server's chosen display number back to us. It writes ASCII
+    // digits + '\n' to the write end and closes it; we read from our end.
+    let (read_fd, write_fd) = make_pipe();
+    let write_raw = write_fd.as_raw_fd();
+
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .args(["-displayfd", &write_raw.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(host) = host_display {
+        cmd.env("DISPLAY", host);
+    }
+    // CLOEXEC is cleared in the child only, between fork and exec. Clearing
+    // it in the parent let every server a parallel test spawned meanwhile
+    // inherit this write end, so the read below never saw EOF.
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(write_raw, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(write_raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {bin}: {e} (xorg-server-xephyr, xorg-server-xvfb)"));
+
+    // Drop the parent's write end so the read returns EOF when the server
+    // closes its copy.
+    drop(write_fd);
+
+    let display_num = read_displayfd(read_fd, STARTUP_TIMEOUT)
+        .unwrap_or_else(|| panic!("{bin} did not report a display number within timeout"));
+    (child, format!(":{}", display_num))
+}
+
 impl Drop for WmTest {
     fn drop(&mut self) {
         if let Some(mut d) = self.demiurge.take() {
@@ -344,6 +392,10 @@ impl Drop for WmTest {
         }
         let _ = self.xephyr.kill();
         let _ = self.xephyr.wait();
+        if let Some(mut host) = self.host.take() {
+            let _ = host.kill();
+            let _ = host.wait();
+        }
         if let Some(dir) = self.config_dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -377,47 +429,41 @@ impl TestAtoms {
 
 // --- internals ---
 
-// Create a pipe whose write end has CLOEXEC cleared so Xephyr inherits
-// it across exec(). Read end keeps CLOEXEC.
+// Create a pipe with CLOEXEC on both ends; the spawn clears it on the
+// write end inside the child only.
 fn make_pipe() -> (OwnedFd, OwnedFd) {
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     assert!(rc == 0, "pipe2 failed: {}", std::io::Error::last_os_error());
     let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    // Clear CLOEXEC on the write end so Xephyr inherits it.
-    unsafe {
-        let flags = libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD);
-        libc::fcntl(write_fd.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-    }
     (read_fd, write_fd)
 }
 
-// Block on the read end of the displayfd pipe. Xephyr writes
-// "<digits>\n" once it has bound an X socket, so a successful read
-// returns the digits without the newline.
+// Read the displayfd pipe until Xephyr's "<digits>\n" arrives, polling
+// against the deadline so a silent Xephyr fails the test instead of
+// hanging it. EOF before a newline means Xephyr died.
 fn read_displayfd(read_fd: OwnedFd, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     let mut file = std::fs::File::from(read_fd);
-    let mut buf = String::new();
-    while Instant::now() < deadline {
-        match file.read_to_string(&mut buf) {
-            Ok(0) => {
-                // EOF before any digits -> Xephyr crashed.
-                if buf.is_empty() {
-                    return None;
-                }
-                break;
+    let mut buf = Vec::with_capacity(16);
+    let mut chunk = [0u8; 16];
+    while !buf.contains(&b'\n') {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let mut pfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let ready = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as i32) };
+        if ready <= 0 {
+            if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            Ok(_) => {
-                if buf.contains('\n') {
-                    break;
-                }
-            }
-            Err(_) => return None,
+            return None;
+        }
+        match file.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
-    buf.trim().parse::<u32>().ok()
+    std::str::from_utf8(&buf).ok()?.trim().parse::<u32>().ok()
 }
 
 // Xephyr accepts connections roughly when -displayfd fires, but a

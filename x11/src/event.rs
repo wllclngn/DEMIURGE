@@ -181,6 +181,11 @@ fn on_key_release(wm: &mut Wm, ev: KeyReleaseEvent) {
 }
 
 fn on_property_notify(wm: &mut Wm, ev: PropertyNotifyEvent) {
+    if ev.atom == u32::from(AtomEnum::WM_HINTS) {
+        let urgent = wm.hints_urgent(ev.window);
+        wm.set_urgent(ev.window, urgent);
+        return;
+    }
     if ev.atom != wm.atoms._NET_WM_NAME && ev.atom != wm.atoms.WM_NAME {
         return;
     }

@@ -1,5 +1,5 @@
 use x11rb::connection::Connection;
-use x11rb::properties::WmClass;
+use x11rb::properties::{WmClass, WmHints, WmSizeHints, WmSizeHintsSpecification};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -53,6 +53,9 @@ pub struct Client {
     pub saved_floating: Option<(i32, i32, u32, u32)>,
     pub saved_fullscreen: Option<(i32, i32, u32, u32)>,
     pub title: String,
+    // Set by the WM_HINTS urgency bit or _NET_WM_STATE_DEMANDS_ATTENTION;
+    // cleared when the client takes focus.
+    pub urgent: bool,
     // Counts WM-initiated unmaps whose UnmapNotify should not unmanage the
     // client. Bumped before each self-unmap, consumed in on_unmap_notify.
     pub unmap_ignore: u8,
@@ -100,6 +103,11 @@ pub struct Wm {
     // Coalesces the burst of CRTC/Output/ScreenChange events that xrandr
     // emits into a single refresh.
     pub monitors_dirty: bool,
+    // Output-mode ownership: Hot-plug and EDID changes set the preferred
+    // mode, and a mode a fullscreen client left behind is restored.
+    pub modes: crate::modes::ModeTracker,
+    // [[display]] entries, for which outputs have a pinned mode.
+    pub displays: Vec<crate::config::Display>,
     // Cursor auto-hide state. Driven by the cursor timerfd in
     // main.rs::run; toggled via reload_config when [cursor] changes.
     pub cursor: CursorState,
@@ -110,6 +118,12 @@ pub struct Wm {
     // own these; leave server default" and skips re-application.
     pub input_repeat_delay: u32,
     pub input_repeat_rate: u32,
+    // XSETTINGS manager. Owns the _XSETTINGS_S0 selection + its own
+    // connection so GTK / Qt apps re-theme live from [appearance] /
+    // [cursor] / [font]. None if another manager (a stray xsettingsd)
+    // already holds the selection -- DEMIURGE then runs without live
+    // theming rather than fighting for it.
+    pub xsettings: Option<crate::xsettings::XSettings>,
 }
 
 impl Wm {
@@ -145,6 +159,9 @@ impl Wm {
         // Initial monitor probe (just to get connector names for
         // [[display]] match patterns). The post-DSR re-query below
         // is what feeds EWMH / bar / arrange.
+        if let Err(e) = monitor::negotiate(&conn, root) {
+            eprintln!("[demiurge] {} (monitor tracking falls back to the core screen)", e);
+        }
         let initial_monitors = monitor::query(&conn, root);
         for (i, mon) in initial_monitors.iter().enumerate() {
             eprintln!(
@@ -300,6 +317,7 @@ impl Wm {
             (0..monitors.len()).map(|i| i.min(last)).collect()
         };
 
+        let modes = crate::modes::ModeTracker::new(&monitor::query_outputs(&conn, root));
         let mut wm = Self {
             conn,
             root,
@@ -325,12 +343,31 @@ impl Wm {
             keymap,
             bar: Some(bar),
             monitors_dirty: false,
+            modes,
+            displays: config.displays.clone(),
             cursor: CursorState::new(
                 config.cursor.auto_hide,
                 config.cursor.auto_hide_seconds,
             ),
             input_repeat_delay: config.input.keyboard.repeat_delay,
             input_repeat_rate: config.input.keyboard.repeat_rate,
+            // Become the XSETTINGS manager + publish the initial theme.
+            // Best-effort: a failure (another manager running) leaves
+            // this None and the desktop simply doesn't push live theme
+            // updates -- the static GTK files from `demiurge --setup`
+            // still apply on app launch.
+            xsettings: match crate::xsettings::XSettings::acquire() {
+                Ok(mut xs) => {
+                    if let Err(e) = xs.publish(config) {
+                        eprintln!("[demiurge] xsettings publish: {}", e);
+                    }
+                    Some(xs)
+                }
+                Err(e) => {
+                    eprintln!("[demiurge] xsettings unavailable: {}", e);
+                    None
+                }
+            },
         };
 
         // Manage pre-existing windows
@@ -365,6 +402,16 @@ impl Wm {
     }
 
     // WINDOW MANAGEMENT
+
+    fn has_user_position(&self, window: Window) -> bool {
+        WmSizeHints::get_normal_hints(&self.conn, window)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .flatten()
+            .is_some_and(|h| {
+                matches!(h.position, Some((WmSizeHintsSpecification::UserSpecified, _, _)))
+            })
+    }
 
     pub fn manage(&mut self, window: Window) {
         // Skip if already managed or is our own window
@@ -420,12 +467,40 @@ impl Wm {
             .unwrap_or((0, 0, 800, 600));
 
         let should_float = self.is_floating_type(window) || self.is_transient(window);
+        let floating = should_float || self.layouts[target_tag] == Layout::Floating;
         let title = self.get_title(window);
+
+        // A floating window lands wherever it asks unless placed here: Most
+        // clients ask for 0,0, under the bar. Only a user-specified position
+        // (USPosition, e.g. -geometry) is kept.
+        let (x, y, w, h) = if floating && !self.has_user_position(window) {
+            let mi = self.monitor_for_tag(target_tag).unwrap_or(self.focused_monitor);
+            let mon = self.monitors.get(mi).unwrap_or_else(|| self.monitors.first());
+            let placed = crate::layout::center_in_work_area(
+                mon.x,
+                mon.y + self.bar_height as i32,
+                mon.width,
+                mon.height.saturating_sub(self.bar_height),
+                w,
+                h,
+            );
+            let _ = self.conn.configure_window(
+                window,
+                &ConfigureWindowAux::new()
+                    .x(placed.0)
+                    .y(placed.1)
+                    .width(placed.2)
+                    .height(placed.3),
+            );
+            placed
+        } else {
+            (x, y, w, h)
+        };
 
         let mut client = Client {
             window,
             tag: target_tag,
-            floating: should_float || self.layouts[target_tag] == Layout::Floating,
+            floating,
             fullscreen: false,
             above: false,
             x,
@@ -435,6 +510,7 @@ impl Wm {
             saved_floating: None,
             saved_fullscreen: None,
             title: title.clone(),
+            urgent: self.hints_urgent(window),
             unmap_ignore: 0,
         };
 
@@ -443,6 +519,7 @@ impl Wm {
         if initial_state.contains(&self.atoms._NET_WM_STATE_FULLSCREEN) {
             client.fullscreen = true;
             client.saved_fullscreen = Some((x, y, w, h));
+            self.modes.on_fullscreen_appeared(std::time::Instant::now());
         }
         if initial_state.contains(&self.atoms._NET_WM_STATE_ABOVE) {
             client.above = true;
@@ -504,7 +581,11 @@ impl Wm {
     pub fn unmanage(&mut self, window: Window) {
         if let Some(pos) = self.clients.iter().position(|c| c.window == window) {
             let tag = self.clients[pos].tag;
+            let was_fullscreen = self.clients[pos].fullscreen;
             self.clients.remove(pos);
+            if was_fullscreen {
+                self.fullscreen_ended();
+            }
             mru::on_unmanage(self, window);
             self.update_client_list();
 
@@ -568,6 +649,21 @@ impl Wm {
                     self.active_tags[mi] as u32,
                 );
             }
+        }
+
+        // The click-to-focus grab lives only on unfocused clients.
+        if let Some(old) = self.focus
+            && Some(old) != window
+            && self.clients.iter().any(|c| c.window == old)
+        {
+            crate::mouse::grab_focus_button(&self.conn, old);
+        }
+        if let Some(win) = window {
+            crate::mouse::ungrab_focus_button(&self.conn, win);
+        }
+
+        if let Some(win) = window {
+            self.clear_urgent(win);
         }
 
         self.focus = window;
@@ -1058,7 +1154,16 @@ impl Wm {
             let y_root = data[1] as i16;
             let direction = data[2];
             match direction {
-                8 => crate::mouse::start_csd_move(self, msg.window, x_root, y_root),
+                0..=7 => {
+                    if let Some(edges) = crate::mouse::Edges::from_moveresize(direction) {
+                        let kind = crate::mouse::DragKind::Resize(edges);
+                        crate::mouse::start_csd_drag(self, msg.window, x_root, y_root, kind);
+                    }
+                }
+                8 => {
+                    let kind = crate::mouse::DragKind::Move;
+                    crate::mouse::start_csd_drag(self, msg.window, x_root, y_root, kind);
+                }
                 11 => {
                     if self.drag.is_some() {
                         crate::mouse::end_drag(self);
@@ -1082,6 +1187,23 @@ impl Wm {
     }
 
     fn handle_state_request(&mut self, window: Window, action: u32, prop1: u32, prop2: u32) {
+        let attention = self.atoms._NET_WM_STATE_DEMANDS_ATTENTION;
+        if (prop1 == attention || prop2 == attention)
+            && let Some(current) = self.clients.iter().find(|c| c.window == window).map(|c| c.urgent)
+        {
+            let urgent = match action {
+                1 => true,
+                0 => false,
+                2 => !current,
+                _ => current,
+            };
+            self.set_urgent(window, urgent);
+            let other = if prop1 == attention { prop2 } else { prop1 };
+            if other != 0 {
+                self.handle_state_request(window, action, other, 0);
+            }
+            return;
+        }
         if prop1 == self.atoms._NET_WM_STATE_FULLSCREEN
             || prop2 == self.atoms._NET_WM_STATE_FULLSCREEN
         {
@@ -1092,7 +1214,13 @@ impl Wm {
                     2 => !self.clients[pos].fullscreen,
                     _ => return,
                 };
+                let was_fs = self.clients[pos].fullscreen;
                 self.clients[pos].fullscreen = should_fs;
+                if should_fs && !was_fs {
+                    self.modes.on_fullscreen_appeared(std::time::Instant::now());
+                } else if was_fs && !should_fs {
+                    self.fullscreen_ended();
+                }
                 if should_fs {
                     let c = &self.clients[pos];
                     self.clients[pos].saved_fullscreen = Some((c.x, c.y, c.w, c.h));
@@ -1280,6 +1408,7 @@ impl Wm {
     }
 
     pub fn reload_config(&mut self, config: &Config) {
+        self.displays = config.displays.clone();
         // Recompile and regrab keybindings
         match keys::compile(&config.keybinds, &self.keymap) {
             Ok(bindings) => {
@@ -1392,6 +1521,14 @@ impl Wm {
         if let Some(ref mut bar) = self.bar {
             bar.mark_all_dirty();
         }
+
+        // Re-publish XSETTINGS so running GTK / Qt apps pick up a new
+        // [appearance] theme / accent, [cursor], or [font] live.
+        if let Some(xs) = self.xsettings.as_mut() {
+            if let Err(e) = xs.publish(config) {
+                eprintln!("[{}] [WARN]   xsettings republish: {}", local_time(), e);
+            }
+        }
     }
 
     // Called once per event-loop iteration. Expires stale notifications
@@ -1418,6 +1555,7 @@ impl Wm {
         }
 
         let occupied: Vec<bool> = (0..self.num_tags).map(|t| self.tag_occupied(t)).collect();
+        let urgent: Vec<bool> = (0..self.num_tags).map(|t| self.tag_urgent(t)).collect();
         let (center_text, is_notification) = match &self.notification {
             Some(n) => (n.text.clone(), true),
             None => (
@@ -1433,6 +1571,7 @@ impl Wm {
                 &self.conn,
                 &self.active_tags,
                 &occupied,
+                &urgent,
                 &center_text,
                 is_notification,
             );
@@ -1442,6 +1581,65 @@ impl Wm {
     // Tag has at least one client
     pub fn tag_occupied(&self, tag: usize) -> bool {
         self.clients.iter().any(|c| c.tag == tag)
+    }
+
+    // A fullscreen client went away or left fullscreen. Once none remain,
+    // undo any mode change one of them made.
+    fn fullscreen_ended(&mut self) {
+        if self.clients.iter().any(|c| c.fullscreen) {
+            return;
+        }
+        let outputs = monitor::query_outputs(&self.conn, self.root);
+        let displays = &self.displays;
+        let sets = self
+            .modes
+            .on_fullscreen_gone(&outputs, |name| display::pins_mode(displays, name));
+        for set in sets {
+            display::set_mode(&set.output, set.mode);
+        }
+    }
+
+    pub fn tag_urgent(&self, tag: usize) -> bool {
+        self.clients.iter().any(|c| c.tag == tag && c.urgent)
+    }
+
+    pub fn hints_urgent(&self, window: Window) -> bool {
+        WmHints::get(&self.conn, window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok().flatten())
+            .is_some_and(|h| h.urgent)
+    }
+
+    // Record a client's urgency and mirror it into _NET_WM_STATE. The
+    // focused client is never urgent: It already has the user's attention.
+    pub fn set_urgent(&mut self, window: Window, urgent: bool) {
+        let urgent = urgent && self.focus != Some(window);
+        let Some(client) = self.clients.iter_mut().find(|c| c.window == window) else {
+            return;
+        };
+        if client.urgent == urgent {
+            return;
+        }
+        client.urgent = urgent;
+        let attention = self.atoms._NET_WM_STATE_DEMANDS_ATTENTION;
+        self.send_wm_state(window, u32::from(urgent), attention, 0);
+        if let Some(ref mut bar) = self.bar {
+            bar.mark_tags_dirty();
+        }
+    }
+
+    // Focus answers the urgency, so both sources drop it: The client flag
+    // and _NET_WM_STATE through set_urgent, and the WM_HINTS bit itself, so
+    // the client's next unrelated WM_HINTS write does not raise it again.
+    fn clear_urgent(&mut self, window: Window) {
+        if let Ok(cookie) = WmHints::get(&self.conn, window)
+            && let Ok(Some(mut hints)) = cookie.reply()
+            && hints.urgent
+        {
+            hints.urgent = false;
+            let _ = hints.set(&self.conn, window);
+        }
+        self.set_urgent(window, false);
     }
 
     // Cursor auto-hide tick. Called every ~100ms by the cursor
@@ -1469,6 +1667,21 @@ impl Wm {
     //   4. Bar is marked all-dirty for a full repaint at next commit.
     pub fn refresh_monitors(&mut self) {
         self.monitors_dirty = false;
+
+        // Mode ownership first: A hot-plug or EDID change may call for the
+        // preferred mode, whose own RandR notify brings us back here.
+        let outputs = monitor::query_outputs(&self.conn, self.root);
+        let fullscreen = self.clients.iter().any(|c| c.fullscreen);
+        let displays = &self.displays;
+        let sets = self.modes.on_outputs(
+            &outputs,
+            fullscreen,
+            |name| display::pins_mode(displays, name),
+            std::time::Instant::now(),
+        );
+        for set in sets {
+            display::set_mode(&set.output, set.mode);
+        }
         let new_monitors = monitor::query(&self.conn, self.root);
         if new_monitors == self.monitors {
             return;

@@ -1,18 +1,25 @@
 //! Configuration, override state, and path resolution.
 //!
-//! INI parser for [location] section. JSON override and weather cache via serde.
+//! TOML config with a [location] section, written on first run from the
+//! system timezone's coordinates. JSON override and weather cache via serde.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{WEATHER_REFRESH_SEC, now_epoch};
+
+const ZONE_TABLES: &[&str] = &[
+    "/usr/share/zoneinfo/zone1970.tab",
+    "/usr/share/zoneinfo/zone.tab",
+];
 
 /// Resolved filesystem paths
 #[derive(Clone)]
 pub struct Paths {
     pub config_file: PathBuf,
+    pub legacy_ini: PathBuf,
     pub cache_file: PathBuf,
     pub override_file: PathBuf,
     pub zipdb_file: PathBuf,
@@ -27,21 +34,52 @@ impl Paths {
 
         let config_dir = PathBuf::from(&home).join(".config").join("abraxas");
         fs::create_dir_all(&config_dir)?;
+        Ok(Self::in_dir(&config_dir))
+    }
 
-        Ok(Self {
-            config_file: config_dir.join("config.ini"),
+    pub fn in_dir(config_dir: &Path) -> Self {
+        Self {
+            config_file: config_dir.join("config.toml"),
+            legacy_ini: config_dir.join("config.ini"),
             cache_file: config_dir.join("weather_cache.json"),
             override_file: config_dir.join("override.json"),
             zipdb_file: config_dir.join("us_zipcodes.bin"),
             pid_file: config_dir.join("daemon.pid"),
-        })
+        }
     }
 }
 
 /// Geographic location
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Location {
     pub lat: f64,
     pub lon: f64,
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Missing,
+    Invalid(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Missing => f.write_str("no config file"),
+            ConfigError::Invalid(s) => f.write_str(s),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigToml {
+    location: LocationToml,
+}
+
+#[derive(Deserialize)]
+struct LocationToml {
+    latitude: f64,
+    longitude: f64,
 }
 
 /// Cached weather data
@@ -64,9 +102,167 @@ pub struct OverrideState {
     pub start_temp: i32,
 }
 
-/// Load location from INI config
-pub fn load_location(paths: &Paths) -> Option<Location> {
-    let content = fs::read_to_string(&paths.config_file).ok()?;
+/// Load location from the TOML config.
+pub fn load_location(paths: &Paths) -> Result<Location, ConfigError> {
+    let content = match fs::read_to_string(&paths.config_file) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ConfigError::Missing),
+        Err(e) => {
+            return Err(ConfigError::Invalid(format!(
+                "{}: {}",
+                paths.config_file.display(),
+                e
+            )))
+        }
+    };
+    parse_location_toml(&content)
+        .map_err(|e| ConfigError::Invalid(format!("{}: {}", paths.config_file.display(), e)))
+}
+
+fn parse_location_toml(content: &str) -> Result<Location, String> {
+    let cfg: ConfigToml = toml::from_str(content).map_err(|e| e.to_string())?;
+    let loc = Location {
+        lat: cfg.location.latitude,
+        lon: cfg.location.longitude,
+    };
+    validate_location(loc)?;
+    Ok(loc)
+}
+
+fn validate_location(loc: Location) -> Result<(), String> {
+    if !loc.lat.is_finite() || !(-90.0..=90.0).contains(&loc.lat) {
+        return Err(format!("latitude {} outside -90..90", loc.lat));
+    }
+    if !loc.lon.is_finite() || !(-180.0..=180.0).contains(&loc.lon) {
+        return Err(format!("longitude {} outside -180..180", loc.lon));
+    }
+    Ok(())
+}
+
+/// Load the location, writing the config first when none exists: From a
+/// legacy config.ini if one is present, else from the system timezone's
+/// reference coordinates. A config that exists but does not parse is an
+/// error, never overwritten.
+pub fn load_or_create_location(paths: &Paths) -> Result<Location, ConfigError> {
+    match load_location(paths) {
+        Err(ConfigError::Missing) => {}
+        other => return other,
+    }
+
+    if let Some(loc) = load_legacy_ini(&paths.legacy_ini) {
+        write_config(paths, loc, "Migrated from config.ini.")
+            .map_err(|e| ConfigError::Invalid(format!("{}: {}", paths.config_file.display(), e)))?;
+        let _ = fs::remove_file(&paths.legacy_ini);
+        eprintln!(
+            "[config] migrated {} -> {}",
+            paths.legacy_ini.display(),
+            paths.config_file.display()
+        );
+        return Ok(loc);
+    }
+
+    let zone = system_timezone().ok_or_else(|| {
+        ConfigError::Invalid("no config, and the system timezone could not be resolved".into())
+    })?;
+    let loc = ZONE_TABLES
+        .iter()
+        .find_map(|t| fs::read_to_string(t).ok().and_then(|s| zone_coordinates(&s, &zone)))
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!("no config, and timezone {} has no coordinates", zone))
+        })?;
+    let note = format!(
+        "Location seeded from the system timezone ({}), the zone's reference city.",
+        zone
+    );
+    write_config(paths, loc, &note)
+        .map_err(|e| ConfigError::Invalid(format!("{}: {}", paths.config_file.display(), e)))?;
+    eprintln!(
+        "[config] wrote {} from timezone {}: {:.4}, {:.4}",
+        paths.config_file.display(),
+        zone,
+        loc.lat,
+        loc.lon
+    );
+    Ok(loc)
+}
+
+fn write_config(paths: &Paths, loc: Location, note: &str) -> Result<(), io::Error> {
+    let content = format!(
+        "# ABRAXAS configuration.\n\
+         # {}\n\
+         # Edit the coordinates, or run `abraxas --set-location ZIP` or\n\
+         # `abraxas --set-location LAT,LON`.\n\
+         \n\
+         [location]\n\
+         latitude = {:.6}\n\
+         longitude = {:.6}\n",
+        note, loc.lat, loc.lon
+    );
+    fs::write(&paths.config_file, content)
+}
+
+/// The IANA zone name: $TZ when it names one, else the /etc/localtime link.
+fn system_timezone() -> Option<String> {
+    if let Ok(tz) = std::env::var("TZ") {
+        let tz = tz.trim_start_matches(':');
+        if !tz.is_empty() && !tz.starts_with('/') {
+            return Some(tz.to_string());
+        }
+    }
+    let target = fs::read_link("/etc/localtime").ok()?;
+    zone_from_path(&target.to_string_lossy())
+}
+
+pub fn zone_from_path(path: &str) -> Option<String> {
+    let (_, zone) = path.split_once("zoneinfo/")?;
+    (!zone.is_empty()).then(|| zone.to_string())
+}
+
+/// Coordinates for `zone` from a zone1970.tab / zone.tab body.
+pub fn zone_coordinates(table: &str, zone: &str) -> Option<Location> {
+    table
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| {
+            let mut cols = l.split('\t');
+            let coords = cols.nth(1)?;
+            (cols.next()? == zone).then(|| parse_iso6709(coords)).flatten()
+        })
+}
+
+/// ISO 6709 as the tz tables write it: ±DDMM±DDDMM or ±DDMMSS±DDDMMSS.
+pub fn parse_iso6709(s: &str) -> Option<Location> {
+    let split = s.get(1..)?.find(['+', '-'])? + 1;
+    let lat = parse_angle(&s[..split], 2)?;
+    let lon = parse_angle(&s[split..], 3)?;
+    let loc = Location { lat, lon };
+    validate_location(loc).ok()?;
+    Some(loc)
+}
+
+fn parse_angle(s: &str, deg_digits: usize) -> Option<f64> {
+    let sign = match s.as_bytes().first()? {
+        b'+' => 1.0,
+        b'-' => -1.0,
+        _ => return None,
+    };
+    let digits = &s[1..];
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let field = |from: usize| -> Option<f64> { digits.get(from..from + 2)?.parse().ok() };
+    let deg: f64 = digits.get(..deg_digits)?.parse().ok()?;
+    let (min, sec) = match digits.len() - deg_digits {
+        2 => (field(deg_digits)?, 0.0),
+        4 => (field(deg_digits)?, field(deg_digits + 2)?),
+        _ => return None,
+    };
+    Some(sign * (deg + min / 60.0 + sec / 3600.0))
+}
+
+/// The pre-TOML config.ini [location] section, read once to migrate it.
+fn load_legacy_ini(path: &Path) -> Option<Location> {
+    let content = fs::read_to_string(path).ok()?;
 
     let mut lat: Option<f64> = None;
     let mut lon: Option<f64> = None;
@@ -98,16 +294,18 @@ pub fn load_location(paths: &Paths) -> Option<Location> {
         }
     }
 
-    match (lat, lon) {
-        (Some(lat), Some(lon)) => Some(Location { lat, lon }),
-        _ => None,
-    }
+    let loc = Location { lat: lat?, lon: lon? };
+    validate_location(loc).ok()?;
+    Some(loc)
 }
 
-/// Save location to INI config
+/// Save location to the TOML config (`--set-location`).
 pub fn save_location(paths: &Paths, lat: f64, lon: f64) -> Result<(), io::Error> {
-    let content = format!("[location]\nlatitude = {:.6}\nlongitude = {:.6}\n", lat, lon);
-    fs::write(&paths.config_file, content)
+    let loc = Location { lat, lon };
+    validate_location(loc).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    write_config(paths, loc, "Set by abraxas --set-location.")?;
+    let _ = fs::remove_file(&paths.legacy_ini);
+    Ok(())
 }
 
 /// Load override state from JSON

@@ -10,7 +10,66 @@ const MIN_SIZE: u32 = 50;
 #[derive(Debug)]
 pub enum DragKind {
     Move,
-    Resize,
+    Resize(Edges),
+}
+
+// The window edges a resize drags; the opposite edges stay put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edges {
+    pub left: bool,
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+}
+
+impl Edges {
+    pub const BOTTOM_RIGHT: Edges = Edges { left: false, top: false, right: true, bottom: true };
+
+    // _NET_WM_MOVERESIZE directions 0-7, clockwise from the top-left corner.
+    pub fn from_moveresize(direction: u32) -> Option<Edges> {
+        let (left, top, right, bottom) = match direction {
+            0 => (true, true, false, false),
+            1 => (false, true, false, false),
+            2 => (false, true, true, false),
+            3 => (false, false, true, false),
+            4 => (false, false, true, true),
+            5 => (false, false, false, true),
+            6 => (true, false, false, true),
+            7 => (true, false, false, false),
+            _ => return None,
+        };
+        Some(Edges { left, top, right, bottom })
+    }
+}
+
+// Geometry after dragging `edges` by (dx, dy) from `orig`. Each dimension
+// stays at least MIN_SIZE, the dragged left or top edge moves while the
+// opposite edge holds, and the top edge never rises above `min_y` (the bar).
+pub fn resize_geometry(
+    edges: Edges,
+    orig: (i32, i32, u32, u32),
+    dx: i32,
+    dy: i32,
+    min_y: i32,
+) -> (i32, i32, u32, u32) {
+    let (ox, oy, ow, oh) = (orig.0, orig.1, orig.2 as i32, orig.3 as i32);
+    let min = MIN_SIZE as i32;
+    let (mut x, mut w) = (ox, ow);
+    if edges.right {
+        w = (ow + dx).max(min);
+    } else if edges.left {
+        w = (ow - dx).max(min);
+        x = ox + ow - w;
+    }
+    let (mut y, mut h) = (oy, oh);
+    if edges.bottom {
+        h = (oh + dy).max(min);
+    } else if edges.top {
+        let bottom = oy + oh;
+        y = (oy + dy).max(min_y).min(bottom - min);
+        h = bottom - y;
+    }
+    (x, y, w as u32, h as u32)
 }
 
 #[derive(Debug)]
@@ -53,10 +112,11 @@ pub fn grab_buttons(conn: &RustConnection, root: Window) {
     }
 }
 
-// Passive grab on Button1 with no modifier on a managed client. SYNC mode lets
-// the WM intercept the click, focus the window, then replay the click so the
-// app still receives it. Without this, plain clicks bypass the WM entirely and
-// click-to-focus doesn't work.
+// Passive grab on Button1 with no modifier on an unfocused client. SYNC mode
+// lets the WM intercept the click, focus the window, then replay the click so
+// the app still receives it. The focused client carries no grab (see
+// ungrab_focus_button): Its clicks go straight to the app instead of freezing
+// the pointer for a round trip through the WM on every press.
 pub fn grab_focus_button(conn: &RustConnection, window: Window) {
     for &lock in &lock_masks() {
         let _ = conn.grab_button(
@@ -73,11 +133,17 @@ pub fn grab_focus_button(conn: &RustConnection, window: Window) {
     }
 }
 
+pub fn ungrab_focus_button(conn: &RustConnection, window: Window) {
+    for &lock in &lock_masks() {
+        let _ = conn.ungrab_button(ButtonIndex::M1, window, ModMask::from(lock));
+    }
+}
+
 pub fn start_drag(wm: &mut Wm, window: Window, ev: &ButtonPressEvent) {
     let kind = if ev.detail == 1 {
         DragKind::Move
     } else {
-        DragKind::Resize
+        DragKind::Resize(Edges::BOTTOM_RIGHT)
     };
 
     // Skip fullscreen windows
@@ -167,18 +233,25 @@ pub fn on_motion(wm: &mut Wm, ev: &MotionNotifyEvent) {
                 &ConfigureWindowAux::new().x(new_x).y(new_y),
             );
         }
-        DragKind::Resize => {
-            let new_w = (drag.orig_w as i32 + dx).max(MIN_SIZE as i32) as u32;
-            let new_h = (drag.orig_h as i32 + dy).max(MIN_SIZE as i32) as u32;
+        DragKind::Resize(edges) => {
+            let (x, y, w, h) = resize_geometry(
+                edges,
+                (drag.orig_x, drag.orig_y, drag.orig_w, drag.orig_h),
+                dx,
+                dy,
+                wm.bar_height as i32,
+            );
 
             if let Some(client) = wm.clients.iter_mut().find(|c| c.window == drag.window) {
-                client.w = new_w;
-                client.h = new_h;
+                client.x = x;
+                client.y = y;
+                client.w = w;
+                client.h = h;
             }
 
             let _ = wm.conn.configure_window(
                 drag.window,
-                &ConfigureWindowAux::new().width(new_w).height(new_h),
+                &ConfigureWindowAux::new().x(x).y(y).width(w).height(h),
             );
         }
     }
@@ -186,8 +259,9 @@ pub fn on_motion(wm: &mut Wm, ev: &MotionNotifyEvent) {
     let _ = wm.conn.flush();
 }
 
-// CSD move: initiated by _NET_WM_MOVERESIZE from applications (e.g. Chromium)
-pub fn start_csd_move(wm: &mut Wm, window: Window, root_x: i16, root_y: i16) {
+// CSD move or edge resize: initiated by _NET_WM_MOVERESIZE from applications
+// (e.g. Chromium) that draw their own decorations.
+pub fn start_csd_drag(wm: &mut Wm, window: Window, root_x: i16, root_y: i16, kind: DragKind) {
     if wm.clients.iter().any(|c| c.window == window && c.fullscreen) {
         return;
     }
@@ -235,7 +309,7 @@ pub fn start_csd_move(wm: &mut Wm, window: Window, root_x: i16, root_y: i16) {
     }
 
     wm.drag = Some(DragState {
-        kind: DragKind::Move,
+        kind,
         window,
         start_x: root_x,
         start_y: root_y,

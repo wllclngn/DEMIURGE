@@ -24,6 +24,53 @@
 // xwayland, layer-shell, session-lock, hardware backends. Each is
 // its own follow-on slice.
 
+pub mod bar;
 pub mod client;
 pub mod dsr;
+pub mod keys;
+pub mod render;
+pub mod tty;
 pub mod wm;
+pub mod xwm;
+
+use std::ffi::OsStr;
+
+use demiurge_core::config::Config;
+
+/// Fork each command in `cfg.startup.commands` via `sh -c`, with
+/// `$WAYLAND_DISPLAY` set on the child so the spawned client knows
+/// which compositor socket to connect to. Mirrors the X11 path's
+/// `spawn::spawn(cmd)` loop in x11/src/main.rs.
+///
+/// Designed to be called by both the winit dev backend (main.rs) and
+/// the TTY backend (tty.rs) right after the wayland socket is bound
+/// + the WAYLAND_DISPLAY env is set on the parent process. Children
+/// inherit the parent env by default, so the explicit env() call here
+/// is belt-and-suspenders.
+///
+/// Failures to spawn are logged but don't abort the compositor: a
+/// missing terminal binary in startup.commands shouldn't black-hole
+/// the session.
+pub fn spawn_startup_commands(cfg: &Config, wayland_display: &OsStr) {
+    for cmd in &cfg.startup.commands {
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .env("WAYLAND_DISPLAY", wayland_display)
+            .spawn()
+        {
+            Ok(child) => {
+                tracing::info!(pid = child.id(), %cmd, "startup command spawned");
+            }
+            Err(e) => {
+                tracing::warn!(%cmd, error = %e, "startup command failed");
+            }
+        }
+    }
+    // startup.spawn (tag-targeted) needs WM_CLASS / app_id matching
+    // wired through cherrypie or the Wm directly. Not yet ported to
+    // Wayland; the entries are silently skipped here.
+    for sp in &cfg.startup.spawn {
+        tracing::debug!(cmd = %sp.cmd, tag = %sp.tag, "tagged startup.spawn skipped (Wayland app_id matching not wired)");
+    }
+}

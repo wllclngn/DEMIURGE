@@ -17,11 +17,13 @@ daemons that complete the desktop also live here:
 | `demiurge` | Window manager. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar, tag-targeted startup spawns, session-scoped child teardown on quit. |
 | `demiurge-wl` | Wayland implementation (smithay-based, currently winit dev backend). DSR via offscreen-render + downscale; the rest of the WM features port from `x11/` over the v0.8+ slices. |
 | `gordian_knot` | Screen locker + idle daemon + lock-on-suspend hook. Setuid-root with seccomp-bpf + landlock sandbox. PAM authentication via inline FFI. |
-| `torrentius` | Rendering subsystem (in `core/`, not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by `demiurge`, `gordian_knot`, eventually `demiurge-wl`. |
-| `abraxas` | Color-temperature daemon. Solar grayline (Jean Meeus algorithms) + sigmoid transitions, NOAA cloud-cover weather awareness, four gamma backends (Wayland wlr-gamma, GNOME D-Bus, DRM ioctl, X11 RandR). io_uring event loop. C23 and Rust implementations side-by-side; pick at install time. Replaces redshift. |
+| `torrentius` | Rendering subsystem (in `core/`, not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by `demiurge`, `gordian_knot`, `medusa`, `gnosis`, eventually `demiurge-wl`. |
+| `medusa` | Screenshot capture and annotation (arrow, rectangle, ellipse, line, marker, pencil, text, blur, numbered steps), pin-to-screen, zero-dependency clipboard holder. Replaces flameshot. |
+| `gnosis` | Keyboard-first file manager: directory view, folder previews, type-to-filter, bookmarks, yank / paste / XDG trash. Replaces pcmanfm. |
+| `abraxas` | Color-temperature daemon. Solar grayline (Jean Meeus algorithms) + sigmoid transitions, NOAA cloud-cover weather awareness, four gamma backends (Wayland wlr-gamma, GNOME D-Bus, DRM ioctl, X11 RandR). io_uring event loop. Replaces redshift. |
 | `cherrypie` | Window-matching daemon. TOML rules + regex over WM_CLASS / title / role / process / type. Hot-reload, RandR-aware multi-monitor placement. Replaces devilspie / devilspie2. |
 
-All five binaries share the same workspace version. abraxas and
+Every binary shares the same workspace version. abraxas and
 cherrypie were independent projects before being absorbed; they now
 ship under DEMIURGE's release cadence.
 
@@ -32,20 +34,56 @@ CARGO_TARGET_DIR=/tmp/demiurge-build cargo build --release
 CARGO_TARGET_DIR=/tmp/demiurge-build cargo test
 ```
 
-Binaries land in `/tmp/demiurge-build/release/{demiurge, gordian_knot}`.
-92 tests pass across 9 targets.
+Binaries land in `/tmp/demiurge-build/release/` (`demiurge`,
+`gordian_knot`, `medusa`, `gnosis`, `demiurge-wl`, `demiurge-wl-tty`,
+`abraxas`, `cherrypie`). 254 tests pass across 28 test targets, all of
+them in each crate's `tests/` directory; the WM integration tests run
+demiurge inside nested Xephyr servers (inside a private Xvfb for the
+RandR mode tests), and cherrypie's end-to-end tests run against a
+headless Xvfb.
 
-System deps (Arch package names): `cairo pango libpam rust`.
+System deps (Arch package names): `cairo pango libxkbcommon pkgconf
+rustup xorg-server xorg-xinit`, plus `greetd cage` for the login screen
+and `wayland libinput seatd libdrm mesa` for the Wayland stack.
+`./install.py deps` checks all of them against the running system and
+prints the `pacman -S` line for whatever is missing.
 
 ## Install
 
 ```
 ./install.py              # Build, install everything (WM + locker + services)
 ./install.py -y           # Non-interactive
+./install.py deps         # Report system dependencies + pacman line
 ./install.py status       # Show installation status
 ./install.py update       # Rebuild and reinstall if source changed
 ./install.py uninstall    # Remove installed files (config preserved)
 ```
+
+### During an Arch install
+
+install.py runs inside `arch-chroot`, so DEMIURGE lands on the disk in
+the same pass as the base system:
+
+```
+arch-chroot /mnt
+./install.py -y --user <name> --greetd
+```
+
+`--user` names the account that will log in — inside a chroot `$HOME`
+is `/root`, and the config, the systemd user units and the sibling
+daemons all belong to somebody else. Holding root directly, the
+installer writes files itself rather than shelling out to `sudo`
+(which a freshly pacstrapped system may not have) and chowns them to
+that account afterwards.
+
+`--greetd` installs `contrib/greetd/config.toml` and enables
+`greetd.service`, so the machine boots to the GORDIAN KNOT login
+screen instead of a bare TTY. What that login screen then starts comes
+from `[gordian_knot].session_cmd`.
+
+Idle lock and lock-before-suspend need no unit to enable. Set
+`[input.idle] lock_seconds` and demiurge starts `gordian_knot --daemon`
+with the session.
 
 Install layout:
 
@@ -56,19 +94,28 @@ Install layout:
 | `/etc/pam.d/gordian_knot` | root | `auth include system-auth` |
 | `/usr/share/xsessions/demiurge.desktop` | root | Display-manager entry |
 | `~/.config/systemd/user/demiurge.service` | user | WM service |
-| `~/.config/systemd/user/gordian_knot-daemon.service` | user | Idle watcher |
-| `~/.config/systemd/user/gordian_knot-sleep.service` | user | Pre-suspend hook |
 | `~/.config/demiurge/config.toml` | user | Copied from `config.default.toml` only if missing |
+| `/etc/greetd/config.toml` | root | Only with `--greetd`; existing one backed up |
 
-If an existing `config.toml` is present at install time, `install.py` runs
-`demiurge --check-config` against it. A parse failure offers a backup
-(`config.toml.bak`) + replace with the shipped default.
+`~` is the target account's home, which `--user` sets; it is not
+necessarily the account running the installer.
+
+If an existing `config.toml` is present, `install.py` runs
+`gordian_knot --check-config` against it — on install, where a parse
+failure offers a backup (`config.toml.bak`) + replace with the shipped
+default, and on update, where it warns that the schema has moved out
+from under a config that used to work.
 
 ## Run
 
-Session launch (display manager path): the `.desktop` file runs
+Session launch (display manager path): The `.desktop` file runs
 `systemctl --user start --wait demiurge.service`. Logs to
 `journalctl --user -u demiurge`.
+
+Under `startx` from a TTY login (the auto-startx and greetd paths),
+demiurge's stderr is the virtual console it started on, which nobody
+reads once X owns the screen. demiurge detects that and moves its output
+onto journald's stream socket: `journalctl -t demiurge`.
 
 Nested X (Xephyr):
 
@@ -103,8 +150,6 @@ Path: `~/.config/demiurge/config.toml`. ENOENT falls back to
 | `tags` | `[String]` | `["X", "Y", "Z"]` | Must be non-empty |
 | `default_layout` | `String` | `"floating"` | `floating`, `tile`, or `monocle` |
 | `master_ratio` | `f64` | `0.5` | `(0.0, 1.0)` exclusive |
-| `border_width` | `u32` | `0` | Accepted but unused (always 0) |
-| `focus_model` | `String` | `"click"` | Accepted but unused (click-to-focus only) |
 
 ### `[bar]`
 
@@ -185,7 +230,7 @@ to the X server.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `lock_seconds` | `u32` | `0` | Idle threshold for GORDIAN KNOT to fire the locker. `0` falls back to legacy `gordian_knot.idle_timeout_seconds` (default 600). Setting this here is the new path. |
+| `lock_seconds` | `u32` | `0` | Idle threshold for GORDIAN KNOT. Above `0`, demiurge starts `gordian_knot --daemon` with the session: Idle lock plus lock-before-suspend. `0` = no daemon (read at session start). |
 | `screensaver_seconds` | `u32` | `0` | X11 SetScreenSaver timeout. `0` = leave default. |
 | `dpms_standby_seconds` | `u32` | `0` | DPMS standby timer (monitor low-power). |
 | `dpms_suspend_seconds` | `u32` | `0` | DPMS suspend timer (deeper low-power). |
@@ -392,10 +437,41 @@ a tag is on at most one monitor at a time, there's no ambiguity.
 spec doesn't have a per-monitor slot). `_NET_WM_DESKTOP` on a client
 is its tag; the client is mapped iff some monitor is showing that tag.
 
-RandR hot-plug resizes `active_tags` in lockstep: shrink truncates
+RandR hot-plug resizes `active_tags` in lockstep: Shrink truncates
 and clamps `focused_monitor`; growth appends new entries picking
 unique tags so a freshly-plugged screen lands on a previously-hidden
 tag rather than mirroring an existing view.
+
+### Output modes
+
+X scans out whatever mode an output was last given, so DEMIURGE takes
+two decisions the server leaves open:
+
+- **The panel changes:** When an output's advertised mode list changes
+  (hot-plug, or a monitor switching its input layout, as an LG DualUp
+  does leaving picture-by-picture), DEMIURGE sets the new preferred
+  mode. An output a `[[display]]` entry gives a `mode` keeps that mode.
+- **A fullscreen client leaves its mode behind:** X does not revert a
+  RandR mode set when the client that made it dies. A mode change made
+  while a fullscreen client exists, or up to two seconds before one maps
+  (Wine sets the mode before mapping its window), belongs to that client;
+  when no fullscreen client remains, the output returns to its preferred
+  mode (or its `[[display]]` mode). A game killed mid-session no longer
+  strands the desktop at its resolution, and a game that restores its own
+  mode is never second-guessed.
+
+A mode set with no fullscreen client around (`xrandr -s` by hand) is the
+user's and is never undone. Every mode change re-arranges the tiles
+against the new geometry. Both decisions run on RandR notify and window
+events; nothing polls.
+
+## New-window placement
+
+A floating window that asks for no position of its own (no USPosition in
+WM_NORMAL_HINTS) opens centered in the work area of the monitor showing
+its tag, below the bar, its size clamped to that area. Most clients ask
+for 0,0, which would put them under the bar. A user-specified position
+(`-geometry`) is kept. cherrypie rules apply on top of this.
 
 ## Notifications
 
@@ -495,38 +571,61 @@ src/
                     /title/clock), push-driven commit that put_images
                     only dirty rects (see "Bar redraw" section below).
   layout.rs         floating / tile / monocle
-  mouse.rs          Super+drag move/resize, _NET_WM_MOVERESIZE
+  mouse.rs          Super+drag move/resize, click-to-focus grab on
+                    unfocused clients, _NET_WM_MOVERESIZE move and
+                    edge/corner resize
   mru.rs            Cyclical MRU ring
   spawn.rs          posix_spawn with metachar detection; live-child
                     registry + SIGTERM-on-quit (quit_children); resets
                     child signal mask via POSIX_SPAWN_SETSIGMASK so
                     children don't inherit demiurge's blocked signals
-  monitor.rs        RandR monitor query
+  monitor.rs        RandR negotiation, monitor and output queries
+  modes.rs          Output-mode ownership: preferred mode on a panel
+                    change, restore after a fullscreen client
   torrentius.rs     Cairo/Pango primitives shared by demiurge + gordian_knot
 
   gordian_knot/
     mod.rs
-    sysinfo.rs      HOSTNAME/KERNEL/DATE/TIME/UPTIME panels
-    pam.rs          Inline libpam.so.0 FFI
-    privsep.rs      fork + setresuid + PR_SET_NO_NEW_PRIVS
-    seccomp.rs      Raw BPF syscall allowlist
-    landlock.rs     Raw landlock_* syscalls
-    vt.rs           /dev/ttyN acquisition via VT_OPENQRY + VT_LOCKSWITCH
-    x11_lock.rs     Fullscreen override-redirect + grabs + PAM loop
-    daemon.rs       XScreenSaver idle polling
+    privsep.rs      Root holder vs user processes; process hardening
+    secret.rs       mlocked, undumpable, wiped password buffer
+    keyinput.rs     xkbcommon key decoding from the server's layout
+    pam.rs          Inline libpam.so.0 FFI; each attempt in a forked child
+    x11_lock.rs     X11 holder (window, grab, keys, PAM); never draws
+    ui.rs           X11 renderer child (panels, then landlock + seccomp)
+    seccomp.rs      Renderer syscall filter (EPERM + log, never a kill)
+    landlock.rs     Renderer read-only filesystem sandbox
+    vt.rs           VT lock via /dev/tty0 + VT_LOCKSWITCH; --login text UI
+    wl_lock.rs      Wayland ext-session-lock locker (test environment)
+    daemon.rs       Idle watcher + logind sleep delay inhibitor
     inhibit.rs      logind ListInhibitors watcher (zbus)
+    greetd.rs       greetd JSON-IPC client
+    login.rs        --login greeter state machine
+    sysinfo.rs      HOSTNAME/KERNEL/DATE/TIME/UPTIME panels
 
   bin/
-    gordian_knot.rs Locker dispatcher: --vt, --x11, --daemon
+    gordian_knot.rs Dispatcher (--x11, --vt, --wl, --daemon, --login, --ui)
 
 tests/
-  config.rs         Config parsing (19 tests)
+  config.rs         Config parsing, shipped default config (29 tests)
   bar.rs            Color parsing, PATH scan, completion (13 tests)
-  layout.rs         Layout cycle (3 tests)
+  layout.rs         Layout cycle, placement math (6 tests)
   mru.rs            Cyclical MRU ring (15 tests)
   torrentius.rs     Hex parsers, font options, surfaces (9 tests)
   unmap_ignore.rs   Unmap ignore counter invariants (5 tests)
-  gordian_knot.rs   Locker config + sysinfo (12 tests)
+  gordian_knot.rs   Locker config, secret, keys, PAM wire, UI (19 tests)
+  greetd.rs         greetd wire format and a scripted session (8 tests)
+  spawn.rs          Shell-metacharacter detection (8 tests)
+  xsettings.rs      XSETTINGS blob framing (2 tests)
+  gnosis_fs.rs      GNOSIS file operations (5 tests)
+  medusa_tools.rs   MEDUSA palette, tools, blur (3 tests)
+  monitor.rs        Monitor list invariants (6 tests)
+  journal.rs        stderr routing to the journal (3 tests)
+  modes.rs          Output-mode ownership, pure and in Xephyr (13 tests)
+  mouse.rs          Click-to-focus grab, edge resize (8 tests)
+  urgency.rs        Urgency hints and the bar (4 tests)
+  wm_smoke.rs       WM startup and EWMH (5 tests)
+  wm_per_monitor.rs Per-monitor tags (6 tests)
+  wm_placement.rs   New-window placement (2 tests)
   xephyr.py         Manual nested-X harness
 ```
 
@@ -548,44 +647,107 @@ No Qt. No compositor runtime. No PAM helper crate (inline FFI).
 ## GORDIAN KNOT
 
 ```
-gordian_knot                 # X11 in-session lock; VT fallback if X11 grab fails
+gordian_knot                 # Auto: --wl if $WAYLAND_DISPLAY, else --x11, VT fallback
 gordian_knot --vt            # Force VT lock on a fresh /dev/ttyN
 gordian_knot --x11           # Force X11 in-session lock
-gordian_knot --daemon        # Idle watcher; spawns locker on threshold
+gordian_knot --wl            # Force Wayland lock (ext-session-lock-v1)
+gordian_knot --login         # greetd greeter (replaces lightdm-gtk-greeter)
+gordian_knot --daemon        # Idle + lock-before-suspend watcher (demiurge starts it)
 gordian_knot --check-config  # Parse [gordian_knot] and exit 0/1
-gordian_knot --no-sandbox    # Skip seccomp + landlock (debug only)
+gordian_knot --no-sandbox    # Skip the X11 renderer's seccomp + landlock (debug only)
 ```
 
-Security posture:
+One credential surface, three states: login / lock / idle-watch. The
+SYSTEM + USER panels, the keypress state machine, and the
+[appearance].accent theming are shared; login and lock match by
+construction. The states differ only in: prompt for username (login
+yes, lock no), auth backend (login delegates to greetd, lock calls PAM
+directly), and success action (login starts a session, lock unlocks).
 
-- Setuid-root binary. `setresuid` + `PR_SET_NO_NEW_PRIVS` drop to the
-  real user before PAM + UI.
-- seccomp-bpf allowlist via raw BPF (no libseccomp).
-  `SECCOMP_RET_KILL_PROCESS` on any syscall outside the allowlist.
-- landlock read-only sandbox over `/etc /usr /lib /lib64 /proc /sys
-  /dev /run /tmp`. `/home` + `/root` explicitly excluded.
-- PAM via inline FFI against `libpam.so.0` (no pam / pam-sys crate).
-- Signalfd cleanup path releases the VT on SIGSEGV/SIGBUS/SIGFPE.
+### Login screen (`--login`)
 
-Services:
+`gordian_knot --login` is a greetd greeter, replacing
+`lightdm` + `lightdm-gtk-greeter` (and the GTK theme they needed to
+draw the login box). It reads `$GREETD_SOCK`, prompts for username +
+password, and delegates authentication to greetd.
 
-- `gordian_knot-daemon.service` — idle watcher,
-  `WantedBy=graphical-session.target`.
-- `gordian_knot-sleep.service` — `Before=sleep.target suspend.target
-  hibernate.target hybrid-sleep.target`.
+Set it up with greetd + cage (a tiny kiosk Wayland compositor that
+gives the greeter Cairo+Pango subpixel-AA rendering):
 
-Inhibit: zbus watcher on `org.freedesktop.login1.Manager.ListInhibitors`
-suppresses auto-lock during video playback and fullscreen games.
+```
+pacman -S greetd cage
+./install.py --greetd                # or by hand:
+cp contrib/greetd/config.toml /etc/greetd/config.toml
+systemctl enable greetd.service
+systemctl disable lightdm.service    # if migrating
+```
+
+`contrib/greetd/config.toml` names the greeter and nothing else. What
+greetd starts on a successful login is `[gordian_knot].session_cmd`,
+defaulting to the X11 daily-driver:
+
+```toml
+[gordian_knot]
+session_cmd = ["startx", "/usr/local/bin/demiurge"]
+session_env = ["XDG_SESSION_TYPE=x11", "OZONE_PLATFORM=x11"]
+
+#   Wayland instead:
+# session_cmd = ["/usr/local/bin/demiurge-wl-tty"]
+# session_env = ["XDG_SESSION_TYPE=wayland"]
+```
+
+`OZONE_PLATFORM` is set here because the greetd path never touches the
+xsessions entry or the `demiurge.service` user unit that otherwise
+carry it.
+
+### How the lock is built
+
+The binary is setuid-root, and each mode settles its privilege first.
+
+- The lock HOLDER (X11 and VT) becomes root fully, real uid included, so
+  the user's own processes cannot signal it; it is undumpable, has no
+  core limit and sits at `oom_score_adj -1000`. It holds the grab or the
+  VT, decodes keys (X11 through xkbcommon with the server's layout, so
+  Caps Lock, AltGr, keypad digits and non-ASCII passwords work) and never
+  draws or loads a font.
+- PAM runs in a forked child per attempt, so a crashing module costs one
+  attempt, not the lock. PAM's own messages are shown, pam_faillock's
+  lockout notice among them. Nothing that runs PAM sets
+  `PR_SET_NO_NEW_PRIVS`, which would make the kernel ignore
+  `unix_chkpwd`'s setuid bit and reject every password.
+- The password lives in one page mapped once: `mlock`ed,
+  `MADV_DONTDUMP`, wiped with `explicit_bzero` after every attempt.
+- The X11 RENDERER is a separate child: The holder re-execs it as the
+  user with `PR_SET_NO_NEW_PRIVS`, and it learns only how many characters
+  were typed. Each panel is a small persistent surface pushed with a
+  checked `put_image`, so no screen size can exceed the server's request
+  limit. After its first accepted frame it sandboxes itself, landlock
+  (read-only fonts, `/etc`, `/usr`, `/proc`) and seccomp (no exec, no
+  fork; an unlisted syscall is refused with `EPERM` and logged, never a
+  kill). If it dies, the holder keeps the grab and restarts it.
+- The holder takes the grab only once the renderer reports its first
+  frame accepted: A locker that cannot show its prompt never holds
+  input. The VT lock is the fallback only when nothing was locked.
+- The VT lock opens `/dev/tty0` for its ioctls (falling back to
+  `/dev/console`, a serial port wherever `console=ttyS0`).
+
+The daemon runs as the user. It spawns the locker past the idle
+threshold, never a second while one lives, honors logind "idle"
+inhibitors (video playback, fullscreen games), and holds a logind sleep
+delay inhibitor: On suspend it locks, waits for the locker to report the
+lock is up, then lets the machine sleep.
+
+Every test that grabs input, takes a VT, runs PAM or runs setuid runs in
+a QEMU guest only, never on the host: `tests/qemu/guest.py provision`
+once, then `tests/qemu/guest.py test`.
 
 ## Known limitations
 
 - No Alt+Tab overlay (functional cycling only, no thumbnail preview).
-- `_NET_WM_MOVERESIZE` edge-resize directions 0–7 are silently
-  dropped. Affects Chromium-family edge drag.
-- No urgency hints. `WM_HINTS` urgent flag is ignored.
-- `[general] border_width` and `[general] focus_model` parse but have
-  no effect. Click-to-focus is hardcoded; borders are always zero.
-- GORDIAN KNOT on Wayland: VT path works, X11 in-session lock does not.
-- GORDIAN KNOT integration surface (PAM, VT ioctls, seccomp, landlock,
-  D-Bus) is not unit-testable without affecting the test-runner
-  process state. Logic layers are covered; these are manual-verify.
+- GORDIAN KNOT's X11 lock cannot hide typing from other X clients: With
+  the grab held, any client selecting XInput2 raw key events still sees
+  every key (measured in the QEMU suite: 6 of 6). The VT lock gives X no
+  input at all.
+- GORDIAN KNOT on Wayland (test environment only): A locker that dies
+  leaves demiurge-wl locked with no client, as the protocol requires;
+  the compositor does not yet relaunch one.

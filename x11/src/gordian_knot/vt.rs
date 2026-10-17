@@ -1,25 +1,28 @@
-// VT-based lock path: acquire a fresh Linux console, lock VT switching,
-// prompt for password, verify via PAM.
+// VT lock: Acquire a fresh Linux console, lock VT switching, prompt for the
+// password on it, verify through PAM.
 //
-// Entry points:
-//   acquire()    -- parent (root). Opens /dev/console, VT_OPENQRY a fresh
-//                   TTY, VT_ACTIVATE, VT_LOCKSWITCH. Returns a VtSession
-//                   carrying the fds the child needs.
-//   release()    -- parent. Restores VT switching, reactivates the prev VT,
-//                   VT_DISALLOCATE, closes fds. Idempotent.
-//   prompt_loop  -- child (unprivileged after drop). Reads password from
-//                   tty_fd, drives PAM, returns an exit code.
+// The holder runs as root (real uid 0) for the whole lock: It owns the VT
+// ioctls, reads the password from the tty into the mlocked Secret, and
+// runs PAM in a forked child per attempt (pam::authenticate_forked), so a
+// crashing PAM module costs one attempt and VT_LOCKSWITCH is never left
+// set by a dead process. NO_NEW_PRIVS is never set here: It would make the
+// kernel ignore unix_chkpwd's setuid bit and fail every password.
+//
+// The VT ioctls go through /dev/tty0 (the foreground console), falling
+// back to /dev/console, which is a serial port wherever console=ttyS0.
+//
+// The text-mode helpers at the bottom serve --login's greetd greeter.
 
-use std::io;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::RawFd;
 
-use crate::gordian_knot::pam;
+use crate::gordian_knot::privsep::{self, Ident};
+use crate::gordian_knot::secret::Secret;
+use crate::gordian_knot::{pam, sysinfo};
 
-const CONSOLE: &str = "/dev/console";
+const CONSOLES: [&str; 2] = ["/dev/tty0", "/dev/console"];
 
-// Linux VT ioctls (from linux/vt.h). libc doesn't expose the constants --
-// these numeric values are stable kernel ABI.
+// Linux VT ioctls (linux/vt.h); stable kernel ABI.
 const VT_OPENQRY: libc::c_ulong = 0x5600;
 const VT_GETSTATE: libc::c_ulong = 0x5603;
 const VT_ACTIVATE: libc::c_ulong = 0x5606;
@@ -47,76 +50,80 @@ pub struct VtSession {
 
 impl VtSession {
     fn new() -> Self {
-        Self {
-            console_fd: -1,
-            tty_fd: -1,
-            tty_num: -1,
-            prev_vt: -1,
-            switch_locked: false,
-            term_orig: None,
-        }
+        Self { console_fd: -1, tty_fd: -1, tty_num: -1, prev_vt: -1, switch_locked: false, term_orig: None }
     }
 }
 
 fn errno() -> i32 {
-    unsafe { *libc::__errno_location() }
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+// A console fd that answers VT_GETSTATE, with the current VT.
+fn open_console() -> Result<(RawFd, i32), String> {
+    let mut last = String::new();
+    for path in CONSOLES {
+        let c = std::ffi::CString::new(path).unwrap();
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            last = format!("open {}: errno {}", path, errno());
+            continue;
+        }
+        let mut stat = VtStat::default();
+        if unsafe { libc::ioctl(fd, VT_GETSTATE, &mut stat) } == 0 {
+            return Ok((fd, stat.v_active as i32));
+        }
+        last = format!("VT_GETSTATE on {}: errno {}", path, errno());
+        unsafe { libc::close(fd) };
+    }
+    Err(last)
 }
 
 pub fn acquire() -> Result<VtSession, String> {
+    let mut s = VtSession::new();
+    let (fd, active) = open_console()?;
+    s.console_fd = fd;
+    s.prev_vt = active;
     unsafe {
-        let mut s = VtSession::new();
-
-        let cpath = std::ffi::CString::new(CONSOLE).unwrap();
-        s.console_fd = libc::open(cpath.as_ptr(), libc::O_RDWR);
-        if s.console_fd < 0 {
-            return Err(format!("open {}: errno {} (run as root?)", CONSOLE, errno()));
-        }
-
-        let mut stat = VtStat::default();
-        if libc::ioctl(s.console_fd, VT_GETSTATE, &mut stat) < 0 {
-            return Err(format!("VT_GETSTATE: errno {}", errno()));
-        }
-        s.prev_vt = stat.v_active as i32;
-
         let mut new_vt: i32 = -1;
         if libc::ioctl(s.console_fd, VT_OPENQRY, &mut new_vt) < 0 || new_vt < 0 {
-            return Err(format!("VT_OPENQRY: errno {}", errno()));
+            let e = format!("VT_OPENQRY: errno {}", errno());
+            release(&mut s);
+            return Err(e);
         }
         s.tty_num = new_vt;
-
-        let tty_path = format!("/dev/tty{}", new_vt);
-        let ctty = std::ffi::CString::new(tty_path.as_str()).unwrap();
-        s.tty_fd = libc::open(ctty.as_ptr(), libc::O_RDWR);
+        let path = std::ffi::CString::new(format!("/dev/tty{}", new_vt)).unwrap();
+        s.tty_fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
         if s.tty_fd < 0 {
-            return Err(format!("open {}: errno {}", tty_path, errno()));
+            let e = format!("open /dev/tty{}: errno {}", new_vt, errno());
+            release(&mut s);
+            return Err(e);
         }
-
-        if libc::ioctl(s.console_fd, VT_ACTIVATE, new_vt) < 0 {
-            return Err(format!("VT_ACTIVATE: errno {}", errno()));
-        }
-        if libc::ioctl(s.console_fd, VT_WAITACTIVE, new_vt) < 0 {
-            return Err(format!("VT_WAITACTIVE: errno {}", errno()));
+        if libc::ioctl(s.console_fd, VT_ACTIVATE, new_vt) < 0
+            || libc::ioctl(s.console_fd, VT_WAITACTIVE, new_vt) < 0
+        {
+            let e = format!("VT_ACTIVATE {}: errno {}", new_vt, errno());
+            release(&mut s);
+            return Err(e);
         }
         if libc::ioctl(s.console_fd, VT_LOCKSWITCH, 1) < 0 {
-            return Err(format!("VT_LOCKSWITCH: errno {}", errno()));
+            let e = format!("VT_LOCKSWITCH: errno {}", errno());
+            release(&mut s);
+            return Err(e);
         }
         s.switch_locked = true;
-
-        // Capture original termios so we can restore on exit.
         let mut t: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(s.tty_fd, &mut t) == 0 {
             s.term_orig = Some(t);
         }
-
-        Ok(s)
     }
+    Ok(s)
 }
 
-// Idempotent cleanup. Called from the parent after waitpid on the child
-// (or from a crash handler if anything goes wrong).
+// Idempotent cleanup: Restore the tty, unlock switching, return to the
+// previous VT, free the one we took.
 pub fn release(s: &mut VtSession) {
     unsafe {
-        if let Some(orig) = s.term_orig {
+        if let Some(orig) = s.term_orig.take() {
             if s.tty_fd >= 0 {
                 libc::tcsetattr(s.tty_fd, libc::TCSANOW, &orig);
             }
@@ -144,8 +151,73 @@ pub fn release(s: &mut VtSession) {
     }
 }
 
-// Put the terminal into raw-ish mode: no echo, no canonical line buffering,
-// no signal generation from Ctrl+C. Saves original in the VtSession.
+// The whole VT lock: Acquire, prompt until PAM accepts, release. 0 on
+// unlock, 1 if the VT could not be taken.
+pub fn lock(prompt: &str, ident: &Ident) -> i32 {
+    let mut secret = match Secret::new() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[gordian_knot] password buffer: {}", e);
+            return 1;
+        }
+    };
+    let mut session = match acquire() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[gordian_knot] VT acquire: {}", e);
+            return 1;
+        }
+    };
+    privsep::signal_ready();
+    let code = prompt_loop(session.tty_fd, ident, prompt, &mut secret);
+    release(&mut session);
+    code
+}
+
+fn tty_write(fd: RawFd, bytes: &[u8]) {
+    let mut off = 0;
+    while off < bytes.len() {
+        let n = unsafe { libc::write(fd, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off) };
+        if n <= 0 {
+            return;
+        }
+        off += n as usize;
+    }
+}
+
+fn prompt_loop(tty: RawFd, ident: &Ident, prompt: &str, secret: &mut Secret) -> i32 {
+    set_prompt_termios(tty);
+    let mut status = String::new();
+    loop {
+        tty_write(tty, render_text_ui(&ident.name, prompt, &status).as_bytes());
+        if !read_secret_line(tty, secret) {
+            // The tty went away under us; nothing to read a password from.
+            secret.clear();
+            return 1;
+        }
+        if secret.is_empty() {
+            status = "Type your password and press Enter.".into();
+            continue;
+        }
+        tty_write(tty, b"\r\n    verifying...\r\n");
+        let attempt = pam::authenticate_forked(&ident.name, secret);
+        secret.clear();
+        for m in &attempt.messages {
+            eprintln!("[gordian_knot] pam: {}", m);
+        }
+        match attempt.result {
+            Ok(()) => return 0,
+            Err(e) => {
+                eprintln!("[gordian_knot] attempt failed: {}", e);
+                status = attempt.messages.last().cloned().unwrap_or_else(|| e.to_string());
+                // Typed-ahead input was typed blind.
+                unsafe { libc::tcflush(tty, libc::TCIFLUSH) };
+            }
+        }
+    }
+}
+
+// Raw-ish mode: No echo, no line buffering, no signals from Ctrl+C.
 fn set_prompt_termios(tty_fd: RawFd) {
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
@@ -158,115 +230,132 @@ fn set_prompt_termios(tty_fd: RawFd) {
     }
 }
 
-// Child's entry point: draw the text UI, read password, call PAM. Loops
-// on auth failure until success or SIGTERM. Returns an exit code.
-//
-// Text UI is *text* -- drawn with terminal escape sequences, no Cairo.
-// The X11 path handles the pretty-panel rendering; VT stays console-style.
-pub fn prompt_loop(tty_fd: RawFd, user: &str, prompt: &str) -> i32 {
-    set_prompt_termios(tty_fd);
-
-    unsafe {
-        // Route stdio to the TTY so println / eprintln hit the right surface.
-        libc::dup2(tty_fd, 0);
-        libc::dup2(tty_fd, 1);
-        libc::dup2(tty_fd, 2);
-    }
-
-    let mut out = io::stdout();
-
+// Read a line into `secret`, echoing a dot per character. UTF-8 bytes go in
+// whole; BS/DEL drops a character, Ctrl+U clears. False on EOF / error.
+fn read_secret_line(tty: RawFd, secret: &mut Secret) -> bool {
+    secret.clear();
+    let mut b = [0u8; 1];
     loop {
-        // Clear screen + home + draw the SYSTEM stanza + USER stanza.
-        let screen = render_text_ui(user, prompt);
-        let _ = out.write_all(screen.as_bytes());
-        let _ = out.flush();
-
-        let password = match read_password_line(tty_fd) {
-            Some(p) => p,
-            None => return 1, // Eof / read error -- bail, parent will release.
-        };
-
-        // Gate empty submissions. pam_faildelay + pam_faillock compound on
-        // repeated empty attempts and will lock the account out for minutes.
-        // Mashing Enter should be a no-op, not a self-lockout.
-        if password.is_empty() {
-            continue;
+        let n = unsafe { libc::read(tty, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n <= 0 {
+            return false;
         }
-
-        match pam::authenticate(user, &password) {
-            Ok(()) => return 0,
-            Err(e) => {
-                let _ = writeln!(out, "\r\n{}\r", e);
-                let _ = out.flush();
-                // Brief pause so the message is readable before the redraw.
-                unsafe {
-                    let ts = libc::timespec { tv_sec: 1, tv_nsec: 500_000_000 };
-                    libc::nanosleep(&ts, std::ptr::null_mut());
+        match b[0] {
+            b'\r' | b'\n' => return true,
+            0x7f | 0x08 => {
+                if !secret.is_empty() {
+                    secret.pop_char();
+                    tty_write(tty, b"\x08 \x08");
                 }
-                // Don't bail on AuthError::MaxTries here; PAM's own faillock
-                // already throttles. Looping forever matches physlock.
-                let _ = e;
             }
+            0x15 => {
+                for _ in 0..secret.char_count() {
+                    tty_write(tty, b"\x08 \x08");
+                }
+                secret.clear();
+            }
+            c if c >= 0x20 && c != 0x7f => {
+                let starts_char = c & 0xC0 != 0x80;
+                if secret.push(&[c]) && starts_char {
+                    tty_write(tty, "\u{25cf}".as_bytes());
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn render_text_ui(user: &str, prompt: &str) -> String {
-    use crate::gordian_knot::sysinfo;
+fn render_text_ui(user: &str, prompt: &str, status: &str) -> String {
     let mut s = String::with_capacity(1024);
-    // Clear + home.
+    s.push_str("\x1b[2J\x1b[H\r\n");
+    s.push_str("  SYSTEM\r\n");
+    s.push_str(&format!("    HOSTNAME  {}\r\n", sysinfo::hostname()));
+    s.push_str(&format!("    KERNEL    {}\r\n", sysinfo::kernel_release()));
+    s.push_str(&format!("    DATE      {}\r\n", sysinfo::current_date()));
+    s.push_str(&format!("    TIME      {}\r\n", sysinfo::current_time()));
+    s.push_str(&format!("    UPTIME    {}\r\n", sysinfo::uptime_formatted()));
+    s.push_str("\r\n  USER\r\n");
+    s.push_str(&format!("    USER      {}\r\n", user));
+    if !status.is_empty() {
+        s.push_str(&format!("    STATUS    {}\r\n", status));
+    }
+    s.push_str(&format!("    {}  ", prompt));
+    s
+}
+
+// --login (greetd greeter) helpers below: Text UI on the stdin tty greetd
+// attached, with the username prompt above the password.
+
+pub(crate) fn render_login_ui(username_so_far: &str, prompt_label: &str, status: &str) -> String {
+    let mut s = String::with_capacity(1024);
     s.push_str("\x1b[2J\x1b[H");
     s.push_str("\r\n");
-    s.push_str(&format!("  SYSTEM\r\n"));
+    s.push_str("  SYSTEM\r\n");
     s.push_str(&format!("    HOSTNAME  {}\r\n", sysinfo::hostname()));
     s.push_str(&format!("    KERNEL    {}\r\n", sysinfo::kernel_release()));
     s.push_str(&format!("    DATE      {}\r\n", sysinfo::current_date()));
     s.push_str(&format!("    TIME      {}\r\n", sysinfo::current_time()));
     s.push_str(&format!("    UPTIME    {}\r\n", sysinfo::uptime_formatted()));
     s.push_str("\r\n");
-    s.push_str(&format!("  USER\r\n"));
-    s.push_str(&format!("    USER      {}\r\n", user));
-    s.push_str(&format!("    {}  ", prompt));
+    s.push_str("  LOGIN\r\n");
+    s.push_str(&format!("    USERNAME  {}\r\n", username_so_far));
+    if !status.is_empty() {
+        s.push_str(&format!("    STATUS    {}\r\n", status));
+    }
+    s.push_str(&format!("    {}  ", prompt_label));
     s
 }
 
-fn read_password_line(tty_fd: RawFd) -> Option<String> {
+// Read a line from `tty_fd`, echoing each character (visible mode), for the
+// username prompt and greetd's "visible" auth messages. None on EOF.
+pub(crate) fn read_visible_line(tty_fd: RawFd) -> Option<String> {
+    read_line(tty_fd, false)
+}
+
+// The masked counterpart, for greetd's "secret" auth messages.
+pub(crate) fn read_password_line_pub(tty_fd: RawFd) -> Option<String> {
+    read_line(tty_fd, true)
+}
+
+pub(crate) fn set_prompt_termios_pub(tty_fd: RawFd) {
+    set_prompt_termios(tty_fd);
+}
+
+fn read_line(tty_fd: RawFd, masked: bool) -> Option<String> {
     let mut buf = String::new();
     let mut one = [0u8; 1];
     let mut out = io::stdout();
     loop {
-        let n = unsafe {
-            libc::read(tty_fd, one.as_mut_ptr() as *mut libc::c_void, 1)
-        };
+        let n = unsafe { libc::read(tty_fd, one.as_mut_ptr() as *mut libc::c_void, 1) };
         if n <= 0 {
             return None;
         }
-        let ch = one[0];
-        match ch {
+        match one[0] {
             b'\r' | b'\n' => {
                 let _ = out.write_all(b"\r\n");
                 let _ = out.flush();
                 return Some(buf);
             }
             0x7f | 0x08 => {
-                // DEL / BS
-                if !buf.is_empty() {
-                    buf.pop();
+                if buf.pop().is_some() {
                     let _ = out.write_all(b"\x08 \x08");
                     let _ = out.flush();
                 }
             }
             0x15 => {
-                // Ctrl+U: clear line.
                 for _ in 0..buf.chars().count() {
                     let _ = out.write_all(b"\x08 \x08");
                 }
                 buf.clear();
                 let _ = out.flush();
             }
-            ch if ch >= 0x20 && ch < 0x7f => {
+            ch if (0x20..0x7f).contains(&ch) => {
                 buf.push(ch as char);
-                let _ = out.write_all("\u{25cf}".as_bytes());
+                if masked {
+                    let _ = out.write_all("\u{25cf}".as_bytes());
+                } else {
+                    let _ = out.write_all(&[ch]);
+                }
                 let _ = out.flush();
             }
             _ => {}
