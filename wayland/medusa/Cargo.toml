@@ -1,0 +1,19 @@
+[package]
+name = "medusa-wl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "medusa-wl"
+path = "src/main.rs"
+
+[dependencies]
+medusa-core = { path = "../../core/medusa" }
+demiurge-wl-client = { path = "../client" }
+cairo-rs = { version = "0.20", features = ["png"] }
+libc = "0.2"
+# As in wayland/client: No xkbcommon 0.7, and one build of each Wayland
+# crate with demiurge-wl's smithay.
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

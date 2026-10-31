@@ -1,0 +1,26 @@
+[package]
+name = "gnosis-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "gnosis"
+
+[dependencies]
+demiurge-core = { path = "../demiurge" }
+cairo-rs = { version = "0.20", features = ["png"] }
+pango = "0.20"
+pangocairo = "0.20"
+libc = "0.2"
+# D-Bus client for the drives (udisks2). zbus 4 with its default async-io
+# runtime (smol-based, tiny); its blocking re-exports serve, since the calls
+# are infrequent.
+zbus = "4"
+# Image thumbnails: The decoders GNOSIS shows (PNG, JPEG, GIF, WebP), and
+# png itself for the Thumb::URI / Thumb::MTime text chunks the freedesktop
+# thumbnail spec keeps inside each thumbnail.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+png = "0.18"
+
+[dev-dependencies]
+tempfile = "3"

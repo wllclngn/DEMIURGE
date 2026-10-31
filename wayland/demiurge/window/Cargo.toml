@@ -1,0 +1,12 @@
+[package]
+name = "demiurge-wl-window"
+version.workspace = true
+edition.workspace = true
+
+# The test window. Depends on smithay only: It cannot see the
+# compositor, so no DEMIURGE behavior can land here.
+[dependencies]
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "renderer_gl",
+] }

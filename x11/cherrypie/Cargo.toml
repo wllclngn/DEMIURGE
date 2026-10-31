@@ -1,0 +1,19 @@
+[package]
+name = "cherrypie-x11"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cherrypie"
+path = "src/main.rs"
+
+[dependencies]
+cherrypie-core = { path = "../../core/cherrypie" }
+x11rb = { version = "0.13", features = ["randr"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"
+serde_json = "1"
+serde = "1"

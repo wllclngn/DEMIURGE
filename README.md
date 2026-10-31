@@ -1,31 +1,43 @@
 # DEMIURGE
 
-ATTENTION: There are currently plans to implement DEMIURGE in Wayland. However, w/ the present state of awesomewm on Arch Linux, DEMIURGE's release was expedited. As of 4/20/2026 X11 is the only implementation of DEMIURGE available.
+A Linux desktop in Rust, on two stacks: An X11 window manager, a drop-in
+replacement for AwesomeWM, and a Wayland compositor, each with a binary of
+its own for every component of the desktop. X11 is frozen and stays on
+offer, as solid as it is. The Wayland stack carries the same desktop,
+implemented in Wayland rather than borrowed through XWayland, which it
+keeps only for X11 applications.
 
-Minimal X11 window manager in Rust. Drop-in replacement for AwesomeWM. Non-reparenting, single-threaded, zero mutexes. Ships GORDIAN KNOT (screen locker) and a shared rendering module (`torrentius`) in the same Cargo package.
-
-Target: rustc 1.85+ (Rust 2024 edition). Linux only. X11 only.
+Target: rustc 1.85+ (Rust 2024 edition). Linux only.
 
 ## Components
 
-DEMIURGE is a Cargo workspace. The window manager itself lives in
-`x11/` and `wayland/` with shared logic in `core/`. Two adjacent
-daemons that complete the desktop also live here:
+DEMIURGE is one Cargo workspace, laid out by stack:
 
-| Binary / module | Role |
+- `core/` holds what both stacks build on: `core/demiurge` (the config,
+  the layout, the bar's painter, the spawner, the clock, the session and
+  `torrentius`, the Cairo + Pango primitives every component draws with)
+  and each component's crate, everything of it that is not one stack's.
+- `x11/` holds the window manager, the X11 binary of each component and
+  `x11/client`, what those binaries share (the X keymap, screen capture).
+- `wayland/` holds the compositor (`wayland/demiurge`, with its `screen`
+  and `window` backends), the Wayland binary of each component and
+  `wayland/client`, what those share (the keyboard through xkbcommon with
+  key repeat, drawing into `wl_shm`, the event loop, screen capture).
+  Nothing under `wayland/` but the compositor speaks X11, and it only to
+  XWayland's clients.
+
+| Component | Role |
 |---|---|
-| `demiurge` | Window manager. TOML config, inotify hot-reload, signalfd shutdown + SIGCHLD reaping, multi-monitor bar, tag-targeted startup spawns, session-scoped child teardown on quit. |
-| `demiurge-wl` | Wayland implementation (smithay-based, currently winit dev backend). DSR via offscreen-render + downscale; the rest of the WM features port from `x11/` over the v0.8+ slices. |
-| `gordian_knot` | Screen locker + idle daemon + lock-on-suspend hook. Setuid-root with seccomp-bpf + landlock sandbox. PAM authentication via inline FFI. |
-| `torrentius` | Rendering subsystem (in `core/`, not a binary). Cairo/Pango primitives, subpixel-AA text on RGB24 intermediate surfaces, PNG capture, framed-panel renderer. Consumed by `demiurge`, `gordian_knot`, `medusa`, `gnosis`, eventually `demiurge-wl`. |
-| `medusa` | Screenshot capture and annotation (arrow, rectangle, ellipse, line, marker, pencil, text, blur, numbered steps), pin-to-screen, zero-dependency clipboard holder. Replaces flameshot. |
-| `gnosis` | Keyboard-first file manager: directory view, folder previews, type-to-filter, bookmarks, yank / paste / XDG trash. Replaces pcmanfm. |
-| `abraxas` | Color-temperature daemon. Solar grayline (Jean Meeus algorithms) + sigmoid transitions, NOAA cloud-cover weather awareness, four gamma backends (Wayland wlr-gamma, GNOME D-Bus, DRM ioctl, X11 RandR). io_uring event loop. Replaces redshift. |
-| `cherrypie` | Window-matching daemon. TOML rules + regex over WM_CLASS / title / role / process / type. Hot-reload, RandR-aware multi-monitor placement. Replaces devilspie / devilspie2. |
+| DEMIURGE | The window manager: TOML config with inotify hot-reload, tags per monitor, a bar per monitor, title bars, minimize and the tag menu, zoom, Alt+Tab, the run prompt, the idle lock. On Wayland, `demiurge-wl-tty` runs on the real screen from a VT (libseat, udev, DRM, libinput) and `demiurge-wl` is the same compositor in a test window. |
+| GORDIAN KNOT | Screen locker, idle and lock-before-suspend daemon, and greetd greeter. Setuid-root, with a seccomp-bpf + landlock sandboxed renderer and PAM through inline FFI. |
+| MEDUSA | Screenshot capture and annotation (arrow, rectangle, ellipse, line, marker, pencil, text, blur, numbered steps), pin-to-screen and a clipboard holder of its own. Replaces flameshot. |
+| GNOSIS | Keyboard-first file manager: Directory view, folder previews, image thumbnails (the freedesktop cache, shared with other apps), a sidebar of bookmarks and drives (`s`; udisks2 mount on Enter, unmount on `u`), type-to-filter, bookmarks, yank / paste / XDG trash. Replaces pcmanfm. |
+| ABRAXAS | Color-temperature daemon: The solar grayline (Jean Meeus's algorithms) with sigmoid transitions and NOAA cloud cover, its gamma set through RandR on X11 and wlr-gamma-control on Wayland, on an io_uring event loop. Replaces redshift. |
+| cherrypie | Window policy: TOML rules and regex over class, title, role, process and type, learned rules and window memory. Each window manager asks it over a socket where every new window goes. Replaces devilspie. |
 
-Every binary shares the same workspace version. abraxas and
-cherrypie were independent projects before being absorbed; they now
-ship under DEMIURGE's release cadence.
+Every binary shares the workspace's version. ABRAXAS and cherrypie were
+independent projects before being absorbed; they keep their own READMEs
+and ship as part of DEMIURGE.
 
 ## Build
 
@@ -34,39 +46,66 @@ CARGO_TARGET_DIR=/tmp/demiurge-build cargo build --release
 CARGO_TARGET_DIR=/tmp/demiurge-build cargo test
 ```
 
-Binaries land in `/tmp/demiurge-build/release/` (`demiurge`,
-`gordian_knot`, `medusa`, `gnosis`, `demiurge-wl`, `demiurge-wl-tty`,
-`abraxas`, `cherrypie`). 254 tests pass across 28 test targets, all of
-them in each crate's `tests/` directory; the WM integration tests run
-demiurge inside nested Xephyr servers (inside a private Xvfb for the
-RandR mode tests), and cherrypie's end-to-end tests run against a
-headless Xvfb.
+Binaries land in `/tmp/demiurge-build/release/`: The X11 stack's under
+their own names (`demiurge`, `gordian_knot`, `medusa`, `gnosis`,
+`abraxas`, `cherrypie`), the Wayland stack's beside them with a `-wl`
+suffix (`demiurge-wl-tty`, `demiurge-wl`, `gordian_knot-wl`, `medusa-wl`,
+`gnosis-wl`, `abraxas-wl`, `cherrypie-wl`). Installed, each goes into its
+stack's directory under its own name.
+
+426 tests pass across 61 test targets, all of them in each crate's
+`tests/` directory. The window manager's integration tests run demiurge
+inside nested Xephyr servers (inside a private Xvfb for the RandR mode
+tests), cherrypie's end-to-end tests run against a headless Xvfb, and
+demiurge-wl's protocol tests run its test window in whatever X server
+`$DISPLAY` names (`xvfb-run` for a headless run).
+
+Everything that needs a real screen, a VT, PAM, setuid or greetd runs in a
+QEMU guest, never on the host: `tests/qemu/guest.py provision` once, then
+`tests/qemu/wayland_suite.py` (demiurge-wl-tty on virtio-gpu, the
+protocol suite, MEDUSA, GNOSIS and the clipboard among it, with XWayland
+off), `tests/qemu/session_test.py` (a real `startx` session),
+`tests/qemu/guest.py test` (the VT lock), `tests/qemu/install_test.py`
+(both stacks installed side by side) and `tests/qemu/greeter_test.py`
+(greetd, cage and the Wayland greeter).
 
 System deps (Arch package names): `cairo pango libxkbcommon pkgconf
 rustup xorg-server xorg-xinit`, plus `greetd cage` for the login screen
 and `wayland libinput seatd libdrm mesa` for the Wayland stack.
-`./install.py deps` checks all of them against the running system and
-prints the `pacman -S` line for whatever is missing.
+`x11/install.py deps` and `wayland/install.py deps` check them against
+the running system and print the `pacman -S` line for whatever is
+missing.
 
 ## Install
 
+Each stack has an installer of its own, over one shared module
+(`installer.py`):
+
 ```
-./install.py              # Build, install everything (WM + locker + services)
-./install.py -y           # Non-interactive
-./install.py deps         # Report system dependencies + pacman line
-./install.py status       # Show installation status
-./install.py update       # Rebuild and reinstall if source changed
-./install.py uninstall    # Remove installed files (config preserved)
+x11/install.py              # Build and install the X11 stack and what both share
+wayland/install.py          # The same for the Wayland stack
+<stack>/install.py -y       # Non-interactive
+<stack>/install.py deps     # Report system dependencies + pacman line
+<stack>/install.py status   # Show installation status
+<stack>/install.py update   # Rebuild and reinstall if source changed
+<stack>/install.py uninstall  # Remove the stack (config preserved)
 ```
+
+Both stacks install side by side, and uninstalling one leaves the other
+whole: What they share (GORDIAN KNOT's PAM file, the unit templates) goes
+with the last one, and the config and greetd's config stay. ABRAXAS and cherrypie, part of
+DEMIURGE, install with either stack unasked and are enabled for that
+stack's session; `--no-abraxas` and `--no-cherrypie` leave one out, and
+`--non-usa` skips ABRAXAS's NOAA weather.
 
 ### During an Arch install
 
-install.py runs inside `arch-chroot`, so DEMIURGE lands on the disk in
+The installer runs inside `arch-chroot`, so DEMIURGE lands on the disk in
 the same pass as the base system:
 
 ```
 arch-chroot /mnt
-./install.py -y --user <name> --greetd
+x11/install.py -y --user <name> --greetd
 ```
 
 `--user` names the account that will log in — inside a chroot `$HOME`
@@ -76,31 +115,38 @@ installer writes files itself rather than shelling out to `sudo`
 (which a freshly pacstrapped system may not have) and chowns them to
 that account afterwards.
 
-`--greetd` installs `contrib/greetd/config.toml` and enables
-`greetd.service`, so the machine boots to the GORDIAN KNOT login
-screen instead of a bare TTY. What that login screen then starts comes
-from `[gordian_knot].session_cmd`.
+`--greetd` installs `contrib/greetd/config.toml`, its greeter the stack's
+own `gordian_knot --login` inside cage, and enables `greetd.service`, so
+the machine boots to the GORDIAN KNOT login screen instead of a bare TTY.
+Each stack's greeter starts its own session unless
+`[gordian_knot].session_cmd` names another.
 
 Idle lock and lock-before-suspend need no unit to enable. Set
 `[input.idle] lock_seconds` and demiurge starts `gordian_knot --daemon`
-with the session.
+with the session; demiurge-wl locks on its own timer.
 
 Install layout:
 
 | Path | Owner | Notes |
 |---|---|---|
-| `/usr/local/bin/demiurge` | root | WM binary |
-| `/usr/local/bin/gordian_knot` | root | Locker, mode 4755 (setuid-root) |
+| `/usr/local/lib/demiurge/x11/bin/` | root | The X11 stack's binaries; `gordian_knot` mode 4755 (setuid-root) |
+| `/usr/local/lib/demiurge/wayland/bin/` | root | The Wayland stack's, `demiurge-wl-tty` among them; `gordian_knot` mode 4755 |
+| `/usr/local/bin/demiurge`, `/usr/local/bin/demiurge-wl-tty` | root | Links to each stack's window manager, the sessions' entry points |
 | `/etc/pam.d/gordian_knot` | root | `auth include system-auth` |
-| `/usr/share/xsessions/demiurge.desktop` | root | Display-manager entry |
-| `~/.config/systemd/user/demiurge.service` | user | WM service |
+| `/usr/share/xsessions/demiurge.desktop` | root | The X11 session's display-manager entry |
+| `/usr/share/wayland-sessions/demiurge.desktop` | root | The Wayland session's |
+| `~/.config/systemd/user/demiurge.service` | user | The X11 window manager's service |
+| `~/.config/systemd/user/demiurge-{x11,wayland}.target` | user | Each stack's session, which both window managers start; binds `graphical-session.target` |
+| `~/.config/systemd/user/{abraxas,cherrypie}@.service` | user | Templates: `abraxas@x11` runs the X11 stack's binary and is wanted by its target, `abraxas@wayland` the Wayland one's |
 | `~/.config/demiurge/config.toml` | user | Copied from `config.default.toml` only if missing |
 | `/etc/greetd/config.toml` | root | Only with `--greetd`; existing one backed up |
 
 `~` is the target account's home, which `--user` sets; it is not
-necessarily the account running the installer.
+necessarily the account running the installer. Each session puts its own
+stack's directory first on the PATH of everything it starts, so a key
+bound to `medusa`, or the lock, runs that stack's binary.
 
-If an existing `config.toml` is present, `install.py` runs
+If an existing `config.toml` is present, the installer runs
 `gordian_knot --check-config` against it — on install, where a parse
 failure offers a backup (`config.toml.bak`) + replace with the shipped
 default, and on update, where it warns that the schema has moved out
@@ -108,14 +154,16 @@ from under a config that used to work.
 
 ## Run
 
-Session launch (display manager path): The `.desktop` file runs
-`systemctl --user start --wait demiurge.service`. Logs to
-`journalctl --user -u demiurge`.
+Session launch (display manager path): The X11 session's `.desktop`
+file runs `systemctl --user start --wait demiurge.service`, which logs to
+`journalctl --user -u demiurge`; the Wayland session's runs
+`demiurge-wl-tty`, as greetd or a VT login does.
 
 Under `startx` from a TTY login (the auto-startx and greetd paths),
 demiurge's stderr is the virtual console it started on, which nobody
 reads once X owns the screen. demiurge detects that and moves its output
-onto journald's stream socket: `journalctl -t demiurge`.
+onto journald's stream socket: `journalctl -t demiurge`. demiurge-wl-tty,
+started from a VT, does the same: `journalctl -t demiurge-wl-tty`.
 
 Nested X (Xephyr):
 
@@ -150,6 +198,25 @@ Path: `~/.config/demiurge/config.toml`. ENOENT falls back to
 | `tags` | `[String]` | `["X", "Y", "Z"]` | Must be non-empty |
 | `default_layout` | `String` | `"floating"` | `floating`, `tile`, or `monocle` |
 | `master_ratio` | `f64` | `0.5` | `(0.0, 1.0)` exclusive |
+| `title_bars` | `bool` | `false` | Title bars on floating windows (see below) |
+| `alt_tab_preview` | `bool` | `true` | demiurge-wl's overlay of the windows cycled through while Alt is held |
+
+Title bars: With `title_bars = true`, every floating normal window and
+dialog sits in a frame under a 30 px bar with its title and macOS traffic
+lights. Close asks the window to close, minimize hides it on its tag, and
+zoom does what Super+= and Super+- do; dragging the bar moves the window.
+The lights go grey on an unfocused window. Tiled windows stay borderless,
+and a tag switched to a tiled layout drops its frames until it floats
+again. A window that asks for no decorations through `_MOTIF_WM_HINTS`
+(Chromium's tab strip, GTK header bars) gets no frame, and fullscreen
+hides the bar. GNOSIS draws the same bar itself when nothing frames it.
+Frames are in the save-set, so if DEMIURGE goes away the server hands
+every window back to the root. Under demiurge-wl the same bar goes on every
+floating window that asks xdg-decoration for server-side decorations.
+
+The layout toggle tiles every window on the tag except those floating on
+their own (dialogs, transients, and windows dragged or zoomed out of the
+tiles).
 
 ### `[bar]`
 
@@ -294,9 +361,9 @@ pass in demiurge-wl. Clients render into an offscreen GLES texture
 sized at `panel_size × dsr_multiplier`; a downscale pass blits that
 texture to the scanout target with bilinear sampling. Lower-quality
 filter than what's possible (Lanczos compute shader is a future
-upgrade; same TOML reaches it). Currently single-output via the
-winit dev backend; per-output matching mirrors the X11 path when
-the udev/DRM backend lands.
+upgrade; same TOML reaches it). The pass runs on both backends; the
+first `[[display]]` entry's multiplier applies to the one monitor driven
+today, and per-output matching comes with multi-output.
 
 **No `[[display]]` entry = no DSR.** Both implementations skip the
 pass entirely when `dsr_multiplier == 1.0`, so the cost when
@@ -312,23 +379,22 @@ commands = [
 
 [[startup.spawn]]
 cmd = "kitty"
-tag = "X"
 
 [[startup.spawn]]
 cmd = "kitty --class montauk-term -e montauk"
-tag = "Z"
-class = "montauk-term"
 ```
 
 `commands` runs each entry via `spawn::spawn()` at WM startup.
 Fire-and-forget.
 
-`[[startup.spawn]]` is tag-targeted. `cmd` launches; the next window
-whose `WM_CLASS` matches is routed to `tag` and kept unmapped until the
-user views that tag. `class` overrides the default derivation (first
-whitespace-separated token of `cmd`). FIFO consumption: two pending
-entries with the same class are matched in spawn order. Config-load
-validation rejects unknown tag names and empty commands.
+`[[startup.spawn]]` launches `cmd` at startup. Which tag a window lands
+on is cherrypie's to answer: A rule's `workspace = "Z"` names the tag. An
+entry still carrying `tag` (the form before v0.9.0) is moved once, on the
+first start of v0.9.0, into a cherrypie rule for its class (`class`, or the
+first token of `cmd`), and the `tag` line leaves this file; until then it
+routes the next window of that class to the tag, kept unmapped until the
+tag is viewed. Config-load validation rejects unknown tag names and empty
+commands.
 
 ### `[[keybind]]`
 
@@ -351,12 +417,15 @@ Actions:
 | `mru_prev` | — | Alt+`/Alt+Shift+Tab backward through the MRU ring, active tag only |
 | `mru_next_global` | — | Super+Tab forward across **all tags** (switches tag as needed) |
 | `mru_prev_global` | — | Super+Shift+Tab backward across all tags |
-| `view_tag` | `"1"` .. `"N"` | Switch focused monitor to tag (1-indexed). On multi-monitor, swaps with another monitor if it was already showing that tag. |
+| `view_tag` | `"1"` .. `"N"` | Switch focused monitor to tag (1-indexed). On multi-monitor, swaps with another monitor if it was already showing that tag. The tag already in view opens the tag menu instead (see below). |
 | `view_prev_tag` | — | Previous tag on focused monitor |
 | `view_next_tag` | — | Next tag on focused monitor |
 | `move_to_tag` | `"1"` .. `"N"` | Move focused window to tag (visibility follows: stays mapped iff some monitor is showing the destination) |
 | `toggle_above` | — | Toggle `_NET_WM_STATE_ABOVE` on focused |
 | `toggle_fullscreen` | — | Toggle `_NET_WM_STATE_FULLSCREEN` on focused |
+| `zoom_in` | — | Super+=: Fill the work area below the bar with the focused window (not fullscreen; the bar stays). A tiled window floats out for it. Advertised as maximized, and an application's own maximize request zooms the same way. A drag ends the zoom; a mode change refits it. |
+| `zoom_out` | — | Super+-: Return the zoomed window to its geometry before the zoom, or to its tile |
+| `minimize` | — | Super+h: Hide the focused window on its tag. It leaves the tiles, focus and Alt+Tab until the tag menu or a pager restores it; an application's own minimize button (ICCCM IconicState) does the same. |
 | `toggle_layout` | — | Cycle active tag's layout |
 | `run_prompt` | — | Show bar run prompt with `$PATH` tab-completion |
 | `screenshot` | — | Write `~/Pictures/screenshot-YYYYmmdd-HHMMSS.png` via `XGetImage` + Cairo PNG |
@@ -367,8 +436,16 @@ Actions:
 | `brightness_up` / `brightness_down` | — | `xbacklight -inc 5` / `-dec 5`, read back, fire bar notification |
 | `media_play_pause` / `media_next` / `media_prev` | — | `playerctl`, fire bar notification with current state + track |
 
+The tag menu: Pressing the key of the tag already in view (Super+2 on
+tag Y), or clicking that tag on the bar, drops a list of the tag's windows
+under its label, minimized ones marked with a diamond. From the key the
+first entry is selected; Up and Down move, Enter picks, Escape closes.
+With the mouse, hovering selects, a click picks and a click anywhere else
+closes. Picking a window restores it if minimized, then focuses and raises
+it.
+
 Modifiers: `Super`, `Alt`, `Control`, `Shift`. Recognized keysym names
-are in `src/keys.rs::name_to_keysym`. Unknown keysyms can be specified
+are in `core/demiurge/src/keys.rs::name_to_keysym`. Unknown keysyms can be specified
 as raw hex (`0xff09` for Tab). Lock/NumLock are stripped from incoming
 state before matching.
 
@@ -384,6 +461,8 @@ Consumed by the locker binary. `demiurge` itself ignores it.
 | `font` | `String` | `"monospace 12"` |
 | `idle_timeout_seconds` | `u64` | `600` |
 | `prompt` | `String` | `"PASSWORD"` |
+| `session_cmd` | `[String]` | The greeter's own stack's session (see GORDIAN KNOT) |
+| `session_env` | `[String]` | Likewise |
 
 ## Window cycling (cyclical MRU ring)
 
@@ -453,15 +532,20 @@ two decisions the server leaves open:
   mode. An output a `[[display]]` entry gives a `mode` keeps that mode.
 - **A fullscreen client leaves its mode behind:** X does not revert a
   RandR mode set when the client that made it dies. A mode change made
-  while a fullscreen client exists, or up to two seconds before one maps
-  (Wine sets the mode before mapping its window), belongs to that client;
-  when no fullscreen client remains, the output returns to its preferred
-  mode (or its `[[display]]` mode). A game killed mid-session no longer
-  strands the desktop at its resolution, and a game that restores its own
-  mode is never second-guessed.
+  while a fullscreen client exists belongs to that client, and so does one
+  made before it maps, however long before (Wine sets the mode before
+  mapping its window; DOOM five seconds before), while the output still
+  sits on that mode. When no fullscreen client remains, the output returns
+  to its preferred mode (or its `[[display]]` mode). A game killed
+  mid-session no longer strands the desktop at its resolution, and a game
+  that restores its own mode is never second-guessed. A window that asks
+  for exactly a monitor's size is fullscreen whether or not it says so, as
+  DOOM's does not.
 
-A mode set with no fullscreen client around (`xrandr -s` by hand) is the
-user's and is never undone. Every mode change re-arranges the tiles
+A mode set by hand (`xrandr -s`) stays while no fullscreen client comes;
+the accepted cost is that a fullscreen video played afterwards takes it
+back to the preferred mode when it closes. A mode changed and changed back
+by hand leaves nothing to claim. Every mode change re-arranges the tiles
 against the new geometry. Both decisions run on RandR notify and window
 events; nothing polls.
 
@@ -471,7 +555,15 @@ A floating window that asks for no position of its own (no USPosition in
 WM_NORMAL_HINTS) opens centered in the work area of the monitor showing
 its tag, below the bar, its size clamped to that area. Most clients ask
 for 0,0, which would put them under the bar. A user-specified position
-(`-geometry`) is kept. cherrypie rules apply on top of this.
+(`-geometry`) is kept. With cherrypie running, DEMIURGE asks it where
+each window goes before mapping, and this placement is the fallback. When
+a move or resize ends, DEMIURGE reports where the window was left, and
+cherrypie's window memory saves the spot in the rule for that class.
+demiurge-wl asks the same of each window: An xdg toplevel at its initial
+commit, with the app_id and title it set, its first configure waiting for
+the answer, and an X11 window at its map request. It reaches the Wayland
+stack's cherrypie on the socket named for its own Wayland display, with
+no XWayland needed.
 
 ## Notifications
 
@@ -495,42 +587,46 @@ overshoot past TTL.
 Runtime deps for the action handlers (not enforced at build time):
 `wpctl` (wireplumber), `xbacklight`, `playerctl`.
 
-## Bar redraw (push-based, per-region atomic)
+## Bar redraw (per region, by comparison)
 
-Each panel owns a persistent Cairo `ImageSurface` allocated at
-`Bar::create` time (not per-draw). The panel width is partitioned
-into four non-overlapping regions:
+Both stacks' bars are drawn by one painter, `core/demiurge/src/bar.rs`. Each
+panel, one per monitor, owns a persistent Cairo `ImageSurface`, its width
+split into four regions side by side:
 
 | Region | Width | Purpose |
 |---|---|---|
-| tags | measured: `TAGS_EDGE_PAD + Σ(padded tag widths) + TAGS_EDGE_PAD` | Tag labels, active highlight |
-| prompt | `PROMPT_MAX_W = 600` | Run-prompt input (only primary panel) |
-| title | remainder | Focused-window title / `NOTIFICATION:` |
-| clock | `CLOCK_MAX_W = 400` | Date/time, right-aligned |
+| tags | measured: `TAGS_EDGE_PAD + Σ(padded tag widths) + TAGS_EDGE_PAD` | Tag labels, the active highlight, urgent and occupied colors |
+| prompt | `PROMPT_MAX_W = 600` | Run-prompt input (primary panel only) |
+| title | remainder | Focused-window title or notification (primary panel only) |
+| clock | `CLOCK_MAX_W = 400` | Date/time, right-aligned in tabular figures |
 
-The tag strip's width is measured at `Bar::create` time (and again
-on any `reload_config`) by running each padded tag name through a
-throwaway Pango layout against the active font and summing the
-pixel widths. `TAGS_EDGE_PAD = 20` provides a mirrored pad on each
-end of the strip; the prompt rect abuts the trailing pad so the
-`> ` prefix always lands exactly one edge-pad past the last tag's
-right edge, regardless of tag-name length or font choice.
+On a bar too narrow for all four, the clock keeps its room first, then
+the tags, then the prompt. The regions never overlap, and each region's
+drawing is clipped to it, so drawing one never touches another.
 
-State mutations call `bar.mark_tags_dirty()`, `mark_prompt_dirty()`,
-`mark_title_dirty()`, `mark_clock_dirty()`, or `mark_all_dirty()` —
-none render directly. `wm.commit_bar()` runs once per event-loop
-iteration (in `main.rs::run`), consumes the dirty flags, renders
-only the dirty regions into the persistent surface, and
-`put_image`s each dirty rect to X. Fast path: no flags set →
-`commit` returns immediately.
+The tag strip's width is measured when the painter is made (at startup
+and on any `reload_config`) by running each padded tag name through a
+throwaway Pango layout against the active font and summing the pixel
+widths. `TAGS_EDGE_PAD = 20` provides a mirrored pad on each end of the
+strip; the prompt region abuts the trailing pad so the `> ` prefix always
+lands exactly one edge-pad past the last tag's right edge, regardless of
+tag-name length or font choice.
 
-`mark_clock_dirty` caches the previous `format_clock()` output
-(`Bar.last_clock_text`). If the formatted string is unchanged, it
-is a no-op — a 1 Hz timer tick that lands inside the same
-wall-clock second produces zero work and zero compositor damage.
+Each panel remembers what each region was last drawn showing.
+`Painter::paint` takes what the bar shows now, draws only the regions
+whose part of it changed (every region the first time) and returns them;
+the stack puts those rects on its screen. On X11, `wm.commit_bar()` runs
+once per event-loop iteration (in `main.rs::run`) and `put_image`s each
+rect drawn, and an Expose puts the panels whole; demiurge-wl uploads each
+into the panel's texture and damages it. With nothing changed, nothing is
+drawn or sent.
 
-The net effect: the 1 Hz clock tick pushes only the clock rect to
-X (a ~400×40 px region, ~64 KB) instead of the full panel
+The clock is read on its 1 Hz tick (`tick_clock`). A tick that lands
+inside the same wall-clock second leaves its text as it was, so it draws
+nothing and makes no damage.
+
+The net effect: the 1 Hz clock tick pushes only the clock rect (a
+400 px wide region, ~64 KB at 40 px tall) instead of the full panel
 (~400 KB). Title/notification/prompt updates similarly ship only
 their region's pixels. On NVIDIA X11 with
 `ForceFullCompositionPipeline = On`, the compositor's per-event
@@ -547,114 +643,124 @@ inotify watches the config file on `IN_CLOSE_WRITE`. On change,
 - Bar height: panel windows reconfigured, `_NET_WM_STRUT_PARTIAL`
   re-emitted, `_NET_WORKAREA` updated, `arrange()` triggered
 - `master_ratio`: reapplied
+- `title_bars`: frames added or removed at once
 
 Keybindings can be edited and applied without restarting the session.
 
 ## Architecture
 
-Single-threaded, zero mutexes. `x11rb` for X11 (pure Rust, no Xlib).
-Cairo + Pango for rendering. `serde` + `toml` for config.
+Each window manager is single-threaded: X11 through `x11rb` (pure Rust, no
+Xlib), Wayland through smithay. Cairo + Pango draw everything, `serde` +
+`toml` read the config. Every component is a core crate of what is not one
+stack's, with an X11 and a Wayland binary over it.
 
 ```
-src/
-  main.rs           CLI + signalfd + poll loop + inotify
-  config.rs         TOML schema + validation
-  atoms.rs          EWMH/ICCCM atoms
-  appearance.rs     XCURSOR env exports + --setup file writer
-  wm.rs             Core state: clients, focus, tags, layouts,
-                    pending_spawns, mru
-  event.rs          X11 event dispatcher
-  keys.rs           Keysym resolution, grabs, action dispatch
-  ewmh.rs           EWMH property setters
-  bar.rs            Multi-monitor status bar. Persistent per-panel
-                    Cairo surface, per-region dirty flags (tags/prompt
-                    /title/clock), push-driven commit that put_images
-                    only dirty rects (see "Bar redraw" section below).
-  layout.rs         floating / tile / monocle
-  mouse.rs          Super+drag move/resize, click-to-focus grab on
-                    unfocused clients, _NET_WM_MOVERESIZE move and
-                    edge/corner resize
-  mru.rs            Cyclical MRU ring
-  spawn.rs          posix_spawn with metachar detection; live-child
-                    registry + SIGTERM-on-quit (quit_children); resets
-                    child signal mask via POSIX_SPAWN_SETSIGMASK so
-                    children don't inherit demiurge's blocked signals
-  monitor.rs        RandR negotiation, monitor and output queries
-  modes.rs          Output-mode ownership: preferred mode on a panel
-                    change, restore after a fullscreen client
-  torrentius.rs     Cairo/Pango primitives shared by demiurge + gordian_knot
+core/
+  demiurge/       config, action, layout, monitor, mru, keys, bar (the
+                  painter), titlebar, tag_menu, drag, prompt, notify,
+                  spawn, clock, journal, session, xsettings, torrentius
+  gordian_knot/   PAM (inline libpam FFI, a forked child per attempt),
+                  privsep, the secret, keyinput, the renderer and its
+                  sandbox (ui, seccomp, landlock), the VT lock (vt, fb,
+                  warden), greetd and login (the greeters' conversation),
+                  greeter (inside cage, either stack's), screen (the
+                  panels it and the Wayland lock draw), sysinfo
+  medusa/         overlay (the frozen desktop, the selection, every key),
+                  tools (the annotations), cli
+  gnosis/         browser (the window's contents and keys), fs, thumbs,
+                  drives, cli
+  abraxas/        solar, sigmoid, weather, zipdb, config, the io_uring
+                  daemon loop and its sandbox, gamma (the backend trait)
+  cherrypie/      rules, learn, memory, place, the API and its server,
+                  the window manager's client, the daemon and its
+                  backend trait
 
-  gordian_knot/
-    mod.rs
-    privsep.rs      Root holder vs user processes; process hardening
-    secret.rs       mlocked, undumpable, wiped password buffer
-    keyinput.rs     xkbcommon key decoding from the server's layout
-    pam.rs          Inline libpam.so.0 FFI; each attempt in a forked child
-    x11_lock.rs     X11 holder (window, grab, keys, PAM); never draws
-    ui.rs           X11 renderer child (panels, then landlock + seccomp)
-    seccomp.rs      Renderer syscall filter (EPERM + log, never a kill)
-    landlock.rs     Renderer read-only filesystem sandbox
-    vt.rs           VT lock via /dev/tty0 + VT_LOCKSWITCH; --login text UI
-    wl_lock.rs      Wayland ext-session-lock locker (test environment)
-    daemon.rs       Idle watcher + logind sleep delay inhibitor
-    inhibit.rs      logind ListInhibitors watcher (zbus)
-    greetd.rs       greetd JSON-IPC client
-    login.rs        --login greeter state machine
-    sysinfo.rs      HOSTNAME/KERNEL/DATE/TIME/UPTIME panels
+x11/
+  demiurge/       The window manager: wm, event, keys, mouse, frame,
+                  layout, monitor, modes, display, bar, tag_menu, mru,
+                  ewmh, atoms, cursor, idle, migrate, xsettings,
+                  appearance
+  client/         The X keymap and screen capture its binaries share
+  gordian_knot/   x11_lock (the holder; never draws), window (the
+                  renderer's X window), decoder, daemon (idle and
+                  lock-before-suspend), inhibit (logind's inhibitors)
+  medusa/         The overlay as an override-redirect window, the pin,
+                  the CLIPBOARD holder
+  gnosis/         The browser in an X window, its corners through SHAPE
+  abraxas/        Gamma through RandR
+  cherrypie/      The X11 backend: placement and learning on X
 
-  bin/
-    gordian_knot.rs Dispatcher (--x11, --vt, --wl, --daemon, --login, --ui)
-
-tests/
-  config.rs         Config parsing, shipped default config (29 tests)
-  bar.rs            Color parsing, PATH scan, completion (13 tests)
-  layout.rs         Layout cycle, placement math (6 tests)
-  mru.rs            Cyclical MRU ring (15 tests)
-  torrentius.rs     Hex parsers, font options, surfaces (9 tests)
-  unmap_ignore.rs   Unmap ignore counter invariants (5 tests)
-  gordian_knot.rs   Locker config, secret, keys, PAM wire, UI (19 tests)
-  greetd.rs         greetd wire format and a scripted session (8 tests)
-  spawn.rs          Shell-metacharacter detection (8 tests)
-  xsettings.rs      XSETTINGS blob framing (2 tests)
-  gnosis_fs.rs      GNOSIS file operations (5 tests)
-  medusa_tools.rs   MEDUSA palette, tools, blur (3 tests)
-  monitor.rs        Monitor list invariants (6 tests)
-  journal.rs        stderr routing to the journal (3 tests)
-  modes.rs          Output-mode ownership, pure and in Xephyr (13 tests)
-  mouse.rs          Click-to-focus grab, edge resize (8 tests)
-  urgency.rs        Urgency hints and the bar (4 tests)
-  wm_smoke.rs       WM startup and EWMH (5 tests)
-  wm_per_monitor.rs Per-monitor tags (6 tests)
-  wm_placement.rs   New-window placement (2 tests)
-  xephyr.py         Manual nested-X harness
+wayland/
+  demiurge/       The compositor: wm, render, input, focus, layer
+                  (wlr-layer-shell), capture (ext-image-copy-capture),
+                  xwm (XWayland), policy (cherrypie), cycle, titlebar,
+                  tag_menu, drag, idle, ime, activation, color, gamma,
+                  steam, bar, cursor, dsr
+    screen/       The real screen: libseat, udev, DRM, libinput
+    window/       The test window (winit)
+  client/         The keyboard (xkbcommon, key repeat), drawing into
+                  wl_shm, the event loop, screen capture
+  gordian_knot/   wl_lock (ext-session-lock)
+  medusa/         The overlay on each monitor's overlay layer, the pin,
+                  the clipboard holder (ext-data-control)
+  gnosis/         The browser in an xdg toplevel
+  abraxas/        Gamma through wlr-gamma-control
+  cherrypie/      The API with no X connection
 ```
+
+Each crate's tests sit in its own `tests/`: core's unit-level suites, the
+X11 window manager's integration tests under Xephyr (MEDUSA and GNOSIS
+end to end among them), demiurge-wl's protocol suite, and
+`tests/qemu/` for everything that needs the guest.
 
 ## Dependencies
 
 ```toml
-x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver"] }
+# Both stacks
 cairo-rs = { version = "0.20", features = ["png"] }
 pangocairo = "0.20"
 pango = "0.20"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 libc = "0.2"
-zbus = "4"
+zbus = "4"                      # GNOSIS's drives, X11 GORDIAN KNOT's inhibitors
+xkbcommon = "0.8"               # The locks' and the Wayland binaries' keys
+
+# X11
+x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver"] }
+
+# Wayland
+smithay = "0.7"                 # Pinned to upstream's 253c1545 (Cargo.toml)
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 ```
 
-No Qt. No compositor runtime. No PAM helper crate (inline FFI).
+No Qt. No GTK. No PAM helper crate (inline FFI).
 
 ## GORDIAN KNOT
 
+The X11 binary:
+
 ```
-gordian_knot                 # Auto: --wl if $WAYLAND_DISPLAY, else --x11, VT fallback
-gordian_knot --vt            # Force VT lock on a fresh /dev/ttyN
-gordian_knot --x11           # Force X11 in-session lock
-gordian_knot --wl            # Force Wayland lock (ext-session-lock-v1)
-gordian_knot --login         # greetd greeter (replaces lightdm-gtk-greeter)
+gordian_knot                 # Auto: The VT lock; --x11 only if no VT can be taken
+gordian_knot --vt            # Force the VT lock on a fresh /dev/ttyN
+gordian_knot --x11           # Force the X11 in-session lock
 gordian_knot --daemon        # Idle + lock-before-suspend watcher (demiurge starts it)
+gordian_knot --login         # greetd greeter inside cage; the TTY greeter with
+                             #   no Wayland display
 gordian_knot --check-config  # Parse [gordian_knot] and exit 0/1
-gordian_knot --no-sandbox    # Skip the X11 renderer's seccomp + landlock (debug only)
+gordian_knot --no-sandbox    # Skip the renderer's seccomp + landlock (debug only)
+```
+
+The Wayland binary:
+
+```
+gordian_knot                 # Lock this session (ext-session-lock-v1); also --wl
+gordian_knot --vt            # The VT lock, as on X11
+gordian_knot --login         # greetd greeter inside cage; the TTY greeter with
+                             #   no Wayland display
+gordian_knot --check-config  # Parse [gordian_knot] and exit 0/1
 ```
 
 One credential surface, three states: login / lock / idle-watch. The
@@ -668,37 +774,41 @@ directly), and success action (login starts a session, lock unlocks).
 
 `gordian_knot --login` is a greetd greeter, replacing
 `lightdm` + `lightdm-gtk-greeter` (and the GTK theme they needed to
-draw the login box). It reads `$GREETD_SOCK`, prompts for username +
-password, and delegates authentication to greetd.
-
-Set it up with greetd + cage (a tiny kiosk Wayland compositor that
-gives the greeter Cairo+Pango subpixel-AA rendering):
+draw the login box). It reads `$GREETD_SOCK`, asks for the username
+and whatever greetd's PAM asks next, and delegates authentication to
+greetd; a wrong password shows greetd's error and asks again. Either
+stack's binary draws the lock's SYSTEM and USER panels fullscreen inside
+cage, a tiny kiosk Wayland compositor and greetd's usual companion,
+whatever session it then starts; with no Wayland display it is the TTY
+greeter.
 
 ```
 pacman -S greetd cage
-./install.py --greetd                # or by hand:
+<stack>/install.py --greetd          # or by hand:
 cp contrib/greetd/config.toml /etc/greetd/config.toml
 systemctl enable greetd.service
 systemctl disable lightdm.service    # if migrating
 ```
 
 `contrib/greetd/config.toml` names the greeter and nothing else. What
-greetd starts on a successful login is `[gordian_knot].session_cmd`,
-defaulting to the X11 daily-driver:
+greetd starts on a successful login is `[gordian_knot].session_cmd` and
+`session_env`, which greetd's `greeter` user normally leaves unset: Each
+stack's greeter then starts its own stack's session.
 
 ```toml
 [gordian_knot]
-session_cmd = ["startx", "/usr/local/bin/demiurge"]
-session_env = ["XDG_SESSION_TYPE=x11", "OZONE_PLATFORM=x11"]
-
-#   Wayland instead:
+#   The X11 stack's greeter:
+# session_cmd = ["startx", "/usr/local/bin/demiurge"]
+# session_env = ["XDG_SESSION_TYPE=x11", "OZONE_PLATFORM=x11"]
+#
+#   The Wayland stack's:
 # session_cmd = ["/usr/local/bin/demiurge-wl-tty"]
 # session_env = ["XDG_SESSION_TYPE=wayland"]
 ```
 
-`OZONE_PLATFORM` is set here because the greetd path never touches the
-xsessions entry or the `demiurge.service` user unit that otherwise
-carry it.
+`OZONE_PLATFORM` is set for X11 because the greetd path never touches the
+xsessions entry or the `demiurge.service` user unit that otherwise carry
+it.
 
 ### How the lock is built
 
@@ -727,7 +837,21 @@ The binary is setuid-root, and each mode settles its privilege first.
   kill). If it dies, the holder keeps the grab and restarts it.
 - The holder takes the grab only once the renderer reports its first
   frame accepted: A locker that cannot show its prompt never holds
-  input. The VT lock is the fallback only when nothing was locked.
+  input.
+- A session lock takes a VT: A fresh console with switching locked
+  (`VT_LOCKSWITCH`), so X, no longer on the active VT, receives no input
+  and no X client can watch the password. The same renderer draws the
+  same panels into `/dev/fb0` (32-bit XRGB) with the console in graphics
+  mode, sandboxed the same way; without such a framebuffer the VT shows a
+  text prompt. The holder reads keys from the tty. The in-X lock is the
+  fallback only where no VT can be taken (a nested or remote X server).
+- `VT_LOCKSWITCH` outlives the process that set it, so before setting it
+  the holder forks a warden: Root, in a session of its own, deaf to
+  hangups and terminal signals, on a pipe from the holder. An unlock
+  tells it the holder is done. If the holder dies instead, the warden
+  gives the console back (text mode, switching unlocked, X's VT active,
+  the taken VT freed) and locks the session again in X, so a dead holder
+  neither strands the machine nor leaves it open.
 - The VT lock opens `/dev/tty0` for its ioctls (falling back to
   `/dev/console`, a serial port wherever `console=ttyS0`).
 
@@ -743,11 +867,11 @@ once, then `tests/qemu/guest.py test`.
 
 ## Known limitations
 
-- No Alt+Tab overlay (functional cycling only, no thumbnail preview).
-- GORDIAN KNOT's X11 lock cannot hide typing from other X clients: With
-  the grab held, any client selecting XInput2 raw key events still sees
-  every key (measured in the QEMU suite: 6 of 6). The VT lock gives X no
-  input at all.
-- GORDIAN KNOT on Wayland (test environment only): A locker that dies
-  leaves demiurge-wl locked with no client, as the protocol requires;
-  the compositor does not yet relaunch one.
+- No Alt+Tab overlay on the X11 stack (functional cycling only, no
+  thumbnail preview); demiurge-wl draws one.
+- GORDIAN KNOT's in-X lock (`--x11`, and the fallback where no VT can be
+  taken) cannot hide typing from other X clients: With the grab held, any
+  client selecting XInput2 raw key events still sees every key (measured
+  in the QEMU suite: 6 of 6). The session lock takes a VT and gives X no
+  input at all: Against a real Xorg on vt1 in QEMU, a spy counted 7 of 7
+  keys typed with X active and 0 of the password typed into the lock.

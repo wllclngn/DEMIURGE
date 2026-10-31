@@ -1,0 +1,46 @@
+# Example /etc/greetd/config.toml for DEMIURGE.
+#
+# greetd is the lightweight display-manager daemon that replaces
+# lightdm; GORDIAN KNOT's --login mode is its greeter, replacing
+# lightdm-gtk-greeter. DEMIURGE does not own /etc -- copy this to
+# /etc/greetd/config.toml and adjust paths for your install.
+#
+# Install the OS side:
+#   pacman -S greetd cage
+#   (copy this file to /etc/greetd/config.toml)
+#   systemctl enable greetd.service
+#   systemctl disable lightdm.service   # if migrating off lightdm
+#
+# Why cage: GORDIAN KNOT --login draws with the same Cairo + Pango
+# subpixel-AA pipeline as the bar and the lock screen. A bare-TTY
+# greeter can only emit terminal escape sequences (no anti-aliased
+# glyphs); cage -- a tiny single-purpose kiosk Wayland compositor, the
+# standard greetd companion -- lets gordian_knot --login run as a
+# Wayland client and render properly. The session it launches can be
+# X11 or Wayland regardless; cage only hosts the greeter.
+
+[terminal]
+# The VT the greeter runs on.
+vt = 1
+
+[default_session]
+# gordian_knot --login runs inside cage. -s enables cage's
+# single-app kiosk behaviour. gordian_knot reads $GREETD_SOCK,
+# prompts for username + password, delegates auth to greetd, and on
+# success asks greetd to start the session command.
+command = "cage -s -- /usr/local/bin/gordian_knot --login"
+# The unprivileged user greetd runs the greeter as.
+user = "greeter"
+
+# The session command gordian_knot --login asks greetd to start on a
+# successful login is NOT set here -- it comes from the user's
+# ~/.config/demiurge/config.toml:
+#
+#   [gordian_knot]
+#   session_cmd = ["startx", "/usr/local/bin/demiurge"]
+#   session_env = ["XDG_SESSION_TYPE=x11", "OZONE_PLATFORM=x11"]
+#
+# For the Wayland session instead:
+#
+#   session_cmd = ["/usr/local/bin/demiurge-wl-tty"]
+#   session_env = ["XDG_SESSION_TYPE=wayland"]

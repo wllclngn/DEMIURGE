@@ -1,0 +1,28 @@
+[package]
+name = "demiurge-x11"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "demiurge_x11"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demiurge"
+path = "src/main.rs"
+
+[dependencies]
+demiurge-core = { path = "../../core/demiurge" }
+demiurge-x11-client = { path = "../client" }
+cherrypie-core = { path = "../../core/cherrypie" }
+x11rb = { version = "0.13", features = ["randr", "render", "xkb", "screensaver", "xfixes", "dpms", "shape", "xtest", "xinput"] }
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+pango = "0.20"
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+# The fake udisks2 GNOSIS's sidebar test runs against.
+zbus = "4"

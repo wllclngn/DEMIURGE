@@ -17,7 +17,7 @@ __pycache__/
 .DS_Store
 
 # IDE caches at workspace root. Per-subproject IDE noise is
-# handled by ABRAXAS/.gitignore and cherrypie/.gitignore.
+# handled by core/abraxas/.gitignore and core/cherrypie/.gitignore.
 .idea/
 .vscode/
 .cache/
@@ -25,7 +25,8 @@ __pycache__/
 .ccls-cache/
 compile_commands.json
 
-# Runtime debris
+# Runtime debris. A core dump is ignored, the core/ crate is not.
 *.log
 core
+!core/
 *.core

@@ -1,0 +1,13 @@
+[package]
+name = "medusa-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "medusa"
+
+[dependencies]
+demiurge-core = { path = "../demiurge" }
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+pango = "0.20"

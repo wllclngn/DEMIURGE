@@ -1,0 +1,25 @@
+[package]
+name = "demiurge-wl-screen"
+version.workspace = true
+edition.workspace = true
+
+# The real screen. Depends on smithay and core's primitives only: It
+# cannot see the compositor, so no DEMIURGE behavior can land here.
+[dependencies]
+demiurge-core = { path = "../../../core/demiurge" }
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_egl",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session_libseat",
+    "renderer_gl",
+    # DrmCompositor lives behind it.
+    "wayland_frontend",
+] }
+tracing = "0.1"
+libc = "0.2"
+# The DRM binding under smithay's drm: A property blob whose size is known
+# only at run time, a CRTC's gamma LUT, which drm's own call cannot make.
+drm-ffi = "0.9"

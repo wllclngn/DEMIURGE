@@ -1,0 +1,12 @@
+[package]
+name = "demiurge-x11-client"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "x11_client"
+
+[dependencies]
+demiurge-core = { path = "../../core/demiurge" }
+x11rb = "0.13"
+cairo-rs = { version = "0.20", features = ["png"] }

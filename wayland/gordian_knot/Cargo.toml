@@ -1,0 +1,22 @@
+[package]
+name = "gordian_knot-wl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gordian_knot-wl"
+path = "src/main.rs"
+
+[dependencies]
+gordian_knot-core = { path = "../../core/gordian_knot" }
+demiurge-core = { path = "../../core/demiurge" }
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+pango = "0.20"
+libc = "0.2"
+xkbcommon = "0.8"
+memmap2 = "0.9"
+# ext-session-lock-v1. Versions match demiurge-wl's smithay transitive deps
+# so cargo resolves to one build of each.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }

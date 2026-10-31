@@ -1,0 +1,19 @@
+[package]
+name = "demiurge-wl-client"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "wl_client"
+
+[dependencies]
+cairo-rs = { version = "0.20", features = ["png"] }
+libc = "0.2"
+memmap2 = "0.9"
+# Without its default xkbcommon 0.7: The keyboard is read through the
+# xkbcommon 0.8 the lock reads it with. Versions match demiurge-wl's smithay
+# transitive deps so cargo resolves to one build of each.
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+xkbcommon = "0.8"

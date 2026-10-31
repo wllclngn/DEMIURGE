@@ -1,0 +1,15 @@
+[package]
+name = "gnosis-x11"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gnosis"
+path = "src/main.rs"
+
+[dependencies]
+gnosis-core = { path = "../../core/gnosis" }
+demiurge-core = { path = "../../core/demiurge" }
+demiurge-x11-client = { path = "../client" }
+x11rb = { version = "0.13", features = ["shape"] }
+libc = "0.2"

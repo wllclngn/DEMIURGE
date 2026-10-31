@@ -1,0 +1,26 @@
+[package]
+name = "gordian_knot-core"
+version.workspace = true
+edition.workspace = true
+
+# What both stacks' GORDIAN KNOT binaries share; nothing of either display
+# server but the greeter, a Wayland client of cage whatever session it
+# starts.
+[dependencies]
+demiurge-core = { path = "../demiurge" }
+cairo-rs = { version = "0.20", features = ["png"] }
+pangocairo = "0.20"
+pango = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+xkbcommon = "0.8"
+memmap2 = "0.9"
+# The greeter inside cage. Versions match demiurge-wl's smithay transitive
+# deps so cargo resolves to one build of each.
+demiurge-wl-client = { path = "../../wayland/client" }
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
+
+[dev-dependencies]
+tempfile = "3"

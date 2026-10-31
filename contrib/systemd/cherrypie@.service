@@ -1,0 +1,13 @@
+[Unit]
+Description=cherrypie window matching daemon (%i)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/lib/demiurge/%i/bin/cherrypie
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=0 78
+
+[Install]
+WantedBy=demiurge-%i.target

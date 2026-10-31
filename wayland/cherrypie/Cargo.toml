@@ -1,0 +1,16 @@
+[package]
+name = "cherrypie-wl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cherrypie-wl"
+path = "src/main.rs"
+
+[dependencies]
+cherrypie-core = { path = "../../core/cherrypie" }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+serde = "1"

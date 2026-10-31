@@ -1,0 +1,16 @@
+[package]
+name = "medusa-x11"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "medusa"
+path = "src/main.rs"
+
+[dependencies]
+medusa-core = { path = "../../core/medusa" }
+demiurge-core = { path = "../../core/demiurge" }
+demiurge-x11-client = { path = "../client" }
+x11rb = "0.13"
+cairo-rs = { version = "0.20", features = ["png"] }
+libc = "0.2"

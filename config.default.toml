@@ -1,6 +1,9 @@
 [general]
 tags = ["X", "Y", "Z"]
 default_layout = "floating"
+# Title bars on floating windows: The title and macOS traffic lights (close,
+# minimize, zoom). Tiled windows stay borderless either way.
+title_bars = false
 
 # [appearance]: the single source of truth for the desktop accent +
 # (projected) GTK theme / icon theme. The accent is read NATIVELY by
@@ -77,15 +80,16 @@ dpms_off_seconds = 0
 
 # GORDIAN KNOT. Colors and font fall back to [appearance]; the two
 # session_* keys are read only by `gordian_knot --login` (the greetd
-# greeter) and decide what greetd execs after a successful auth. The
-# defaults below are the X11 daily-driver; uncomment and swap for the
-# Wayland session.
+# greeter) and decide what greetd execs after a successful auth. Unset,
+# each stack's greeter starts its own session, as below; set, they name
+# another.
 #
 # [gordian_knot]
+#   The X11 stack's greeter:
 # session_cmd = ["startx", "/usr/local/bin/demiurge"]
 # session_env = ["XDG_SESSION_TYPE=x11", "OZONE_PLATFORM=x11"]
 #
-#   Wayland instead:
+#   The Wayland stack's:
 # session_cmd = ["/usr/local/bin/demiurge-wl-tty"]
 # session_env = ["XDG_SESSION_TYPE=wayland"]
 
@@ -103,17 +107,13 @@ dpms_off_seconds = 0
 [startup]
 commands = [
     "xrdb -merge ~/.Xresources",
-    "cherrypie",
 ]
 
 [[startup.spawn]]
 cmd = "kitty"
-tag = "X"
 
 [[startup.spawn]]
 cmd = "kitty --class montauk-term -e montauk"
-tag = "Z"
-class = "montauk-term"
 
 # Terminal
 [[keybind]]
@@ -228,6 +228,23 @@ action = "toggle_above"
 mods = ["Super"]
 key = "f"
 action = "toggle_fullscreen"
+
+# Zoom: Fill the work area below the bar, and back
+[[keybind]]
+mods = ["Super"]
+key = "equal"
+action = "zoom_in"
+
+[[keybind]]
+mods = ["Super"]
+key = "minus"
+action = "zoom_out"
+
+# Minimize: Hide the window on its tag; the tag menu brings it back
+[[keybind]]
+mods = ["Super"]
+key = "h"
+action = "minimize"
 
 # Toggle layout
 [[keybind]]

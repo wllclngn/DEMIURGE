@@ -1,0 +1,16 @@
+[package]
+name = "abraxas-x11"
+version.workspace = true
+edition = "2021"
+
+[[bin]]
+name = "abraxas"
+path = "src/main.rs"
+
+[dependencies]
+abraxas-core = { path = "../../core/abraxas", default-features = false }
+x11rb = { version = "0.13", features = ["randr"] }
+
+[features]
+default = ["noaa"]
+noaa = ["abraxas-core/noaa"]

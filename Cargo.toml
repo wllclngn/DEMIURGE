@@ -1,16 +1,39 @@
 [workspace]
 resolver = "2"
 members = [
-    "core",
-    "x11",
-    "wayland",
-    "ABRAXAS/rust",
-    "cherrypie",
+    "core/abraxas",
+    "core/cherrypie",
+    "core/demiurge",
+    "core/gnosis",
+    "core/gordian_knot",
+    "core/medusa",
+    "x11/abraxas",
+    "x11/cherrypie",
+    "x11/client",
+    "x11/demiurge",
+    "x11/gnosis",
+    "x11/gordian_knot",
+    "x11/medusa",
+    "wayland/abraxas",
+    "wayland/cherrypie",
+    "wayland/client",
+    "wayland/demiurge",
+    "wayland/gnosis",
+    "wayland/gordian_knot",
+    "wayland/medusa",
+    "wayland/demiurge/screen",
+    "wayland/demiurge/window",
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
+
+[patch.crates-io]
+# Upstream's "xwm: clean up by_serial hash map when surface is destroyed":
+# XWayland surfaces paired by serial are let go once destroyed, where 0.7.0
+# kept every one, with its imported texture, for the compositor's life.
+smithay = { git = "https://github.com/Smithay/smithay", rev = "253c154556c7c3e1a75545f087f1b846ce26ea80" }
 
 [profile.release]
 opt-level = "z"

@@ -1,0 +1,510 @@
+mod appearance;
+mod atoms;
+mod bar;
+mod config;
+mod cursor;
+mod display;
+mod event;
+mod ewmh;
+mod frame;
+mod idle;
+mod keys;
+mod layout;
+mod modes;
+mod monitor;
+mod mouse;
+mod migrate;
+mod mru;
+use demiurge_core::spawn;
+mod tag_menu;
+mod torrentius;
+mod wm;
+mod xsettings;
+
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::ConnectionExt as _;
+
+use std::path::PathBuf;
+
+fn main() {
+    let Args { config_path, check_config, setup } = parse_args();
+    demiurge_core::journal::route_stderr_from_vt("demiurge");
+
+    let paths = match config_path {
+        Some(p) => config::Paths::with_config(p),
+        None => match config::Paths::init() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[demiurge] {}", e);
+                std::process::exit(1);
+            }
+        },
+    };
+
+    let cfg = match config::load(&paths) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[demiurge] config error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // --check-config: parse succeeded, we're done. Used by install.py to
+    // detect stale configs before they kill a session at login.
+    if check_config {
+        println!("demiurge: config ok ({})", paths.config_file.display());
+        std::process::exit(0);
+    }
+
+    // --setup: write ~/.gtkrc-2.0, ~/.config/gtk-3.0/settings.ini, and
+    // ~/.icons/default/index.theme from [cursor] and [font] config. Replaces
+    // lxappearance. Does not start the WM.
+    if setup {
+        if let Err(e) = appearance::write_setup_files(&cfg) {
+            eprintln!("[demiurge setup] {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // Export XCURSOR_THEME and XCURSOR_SIZE so every child inherits the
+    // configured cursor. Must happen before any spawn::spawn call.
+    appearance::apply_runtime(&cfg);
+    // Every child finds this stack's binaries (the lock, MEDUSA, GNOSIS)
+    // before any other. SAFETY: still single-threaded, as above.
+    if let Some(path) = spawn::path_with_own_dir() {
+        unsafe { std::env::set_var("PATH", path) }
+    }
+
+    let mut wm = match wm::Wm::init(&cfg) {
+        Ok(wm) => wm,
+        Err(e) => {
+            eprintln!("[demiurge] init failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // The session's services start on this display.
+    let display: Vec<(&str, String)> = ["DISPLAY", "XAUTHORITY"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name, value)))
+        .collect();
+    let session = demiurge_core::session::Session::begin(demiurge_core::session::X11_TARGET, &display)
+        .map_err(|e| eprintln!("[demiurge] session: {}", e))
+        .ok();
+
+    // Spawn startup commands
+    for cmd in &cfg.startup.commands {
+        eprintln!("[demiurge] startup: {}", cmd);
+        spawn::spawn(cmd);
+    }
+
+    // Idle lock + lock-before-suspend, opted into by [input.idle]
+    // lock_seconds. A session child, so it starts with X under startx or
+    // greetd alike and is torn down with the session.
+    if cfg.input.idle.lock_seconds > 0 {
+        eprintln!("[demiurge] startup: gordian_knot --daemon (lock after {}s idle)", cfg.input.idle.lock_seconds);
+        spawn::spawn("gordian_knot --daemon");
+    }
+
+    // Tag-targeted spawns. Each registers a pending WM_CLASS match before
+    // firing the command; Wm::manage consumes the match when the window
+    // appears and routes it to the requested tag.
+    // Spawn tags move into cherrypie rules once. This run still routes by
+    // them, since cherrypie may not have reloaded its rules yet.
+    match cherrypie::config::Paths::init() {
+        Ok(cp) => match migrate::spawn_tags(&cfg, &paths.config_file, &cp.config_file) {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "[demiurge] moved {} [[startup.spawn]] tag(s) into {}",
+                n,
+                cp.config_file.display()
+            ),
+            Err(e) => eprintln!("[demiurge] spawn tags stay in the config: {}", e),
+        },
+        Err(e) => eprintln!("[demiurge] spawn tags stay in the config: cherrypie config: {}", e),
+    }
+
+    for sp in &cfg.startup.spawn {
+        let class_match = sp.class_match();
+        if let Some(target_tag) = sp
+            .tag
+            .as_ref()
+            .and_then(|tag| cfg.general.tags.iter().position(|t| t == tag))
+        {
+            eprintln!(
+                "[demiurge] startup spawn (class='{}', tag={}): {}",
+                class_match, target_tag, sp.cmd
+            );
+            wm.pending_spawns.push(wm::PendingSpawn {
+                class_match,
+                target_tag,
+            });
+        } else {
+            eprintln!("[demiurge] startup spawn: {}", sp.cmd);
+        }
+        spawn::spawn(&sp.cmd);
+    }
+
+    // Setup signalfd for clean shutdown
+    let signal_fd = setup_signalfd();
+
+    // Setup timerfd for 1-second bar clock tick
+    let timer_fd = setup_timerfd();
+
+    // Setup inotify for config hot-reload
+    let inotify_fd = setup_inotify(&paths.config_file);
+
+    // Setup cursor auto-hide timerfd (~100ms tick driving cursor::tick),
+    // ticking only while [cursor] auto_hide is on; a reload arms or
+    // disarms it.
+    let cursor_fd = cursor::setup_timerfd(wm.cursor.auto_hide);
+    wm.cursor.timer_fd = cursor_fd;
+
+    // Event loop
+    run(
+        &mut wm,
+        signal_fd,
+        timer_fd,
+        inotify_fd,
+        cursor_fd,
+        &paths.config_file,
+    );
+
+    // Cleanup, the session's services told to stop while X is still up.
+    if let Some(Err(e)) = session.map(demiurge_core::session::Session::end) {
+        eprintln!("[demiurge] session: {}", e);
+    }
+    cleanup(&wm, timer_fd, inotify_fd, cursor_fd);
+    eprintln!("[demiurge] exiting");
+}
+
+struct Args {
+    config_path: Option<PathBuf>,
+    check_config: bool,
+    setup: bool,
+}
+
+fn parse_args() -> Args {
+    let args: Vec<String> = std::env::args().collect();
+    let mut out = Args { config_path: None, check_config: false, setup: false };
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    out.config_path = Some(PathBuf::from(&args[i]));
+                } else {
+                    eprintln!("[demiurge] --config requires a path");
+                    std::process::exit(1);
+                }
+            }
+            "--check-config" => {
+                out.check_config = true;
+            }
+            "--setup" => {
+                // lxappearance replacement: regenerate GTK config and
+                // ~/.icons/default/index.theme from [cursor] and [font].
+                out.setup = true;
+            }
+            "-v" | "--version" => {
+                println!("demiurge {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "-h" | "--help" => {
+                println!("usage: demiurge [-c config.toml] [--check-config] [--setup] [-v] [-h]");
+                std::process::exit(0);
+            }
+            _ => {
+                eprintln!("[demiurge] unknown argument: {}", args[i]);
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn setup_signalfd() -> i32 {
+    unsafe {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGTERM);
+        libc::sigaddset(&mut mask, libc::SIGCHLD);
+        libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+        let fd = libc::signalfd(-1, &mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC);
+        if fd < 0 {
+            eprintln!("[demiurge] signalfd failed, signals won't be caught cleanly");
+            return -1;
+        }
+        fd
+    }
+}
+
+// Drain all finished children without blocking. Prevents spawned apps (kitty,
+// chromium, electron helpers that exit on failure) from accumulating as
+// zombies in the service cgroup. Also drops each reaped pid from the
+// live-child registry so quit_children doesn't later signal a pid that
+// has since been recycled by the kernel.
+fn reap_children() {
+    spawn::reap_any();
+}
+
+fn setup_timerfd() -> i32 {
+    unsafe {
+        let fd = libc::timerfd_create(
+            libc::CLOCK_MONOTONIC,
+            libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+        );
+        if fd < 0 {
+            eprintln!("[demiurge] timerfd_create failed, clock won't update");
+            return -1;
+        }
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+        };
+        if libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) < 0 {
+            eprintln!("[demiurge] timerfd_settime failed");
+            libc::close(fd);
+            return -1;
+        }
+        fd
+    }
+}
+
+fn setup_inotify(config_path: &std::path::Path) -> i32 {
+    unsafe {
+        let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+        if fd < 0 {
+            eprintln!("[demiurge] inotify_init failed, config reload disabled");
+            return -1;
+        }
+        let path_str = match config_path.to_str() {
+            Some(s) => s,
+            None => {
+                libc::close(fd);
+                return -1;
+            }
+        };
+        let c_path = match std::ffi::CString::new(path_str) {
+            Ok(p) => p,
+            Err(_) => {
+                libc::close(fd);
+                return -1;
+            }
+        };
+        let wd = libc::inotify_add_watch(fd, c_path.as_ptr(), libc::IN_CLOSE_WRITE);
+        if wd < 0 {
+            eprintln!("[demiurge] inotify_add_watch failed for {}", path_str);
+            libc::close(fd);
+            return -1;
+        }
+        eprintln!("[demiurge] watching {} for changes", path_str);
+        fd
+    }
+}
+
+fn poll_events(fd: i32) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events: if fd >= 0 { libc::POLLIN } else { 0 },
+        revents: 0,
+    }
+}
+
+fn run(
+    wm: &mut wm::Wm,
+    signal_fd: i32,
+    timer_fd: i32,
+    inotify_fd: i32,
+    cursor_fd: i32,
+    config_path: &std::path::Path,
+) {
+    let x11_fd = wm.connection_fd();
+
+    // poll() ignores entries with fd < 0, so always pass all 7. The policy
+    // socket (5) comes and goes with cherrypie; its timer (6) fires when an
+    // answer is overdue.
+    let mut fds = [
+        libc::pollfd {
+            fd: x11_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        poll_events(signal_fd),
+        poll_events(timer_fd),
+        poll_events(inotify_fd),
+        poll_events(cursor_fd),
+        poll_events(-1),
+        poll_events(wm.policy.timer_fd()),
+    ];
+    let nfds = fds.len() as libc::nfds_t;
+
+    while wm.running {
+        // Drain all buffered X11 events before polling
+        loop {
+            match wm.conn.poll_for_event() {
+                Ok(Some(ev)) => event::handle(wm, ev),
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[demiurge] x11 error: {}", e);
+                    wm.running = false;
+                    return;
+                }
+            }
+            if !wm.running {
+                return;
+            }
+        }
+
+        // RandR drain: any RandrScreenChangeNotify / RandrNotify in this
+        // iteration's batch has flipped wm.monitors_dirty. Refresh once,
+        // before commit_bar, so the bar repaints with the new geometry.
+        if wm.monitors_dirty {
+            wm.refresh_monitors();
+        }
+
+        // The bar's single commit point per event-loop iteration: Its
+        // painter draws and puts only the regions whose state changed
+        // earlier in this iteration.
+        wm.commit_bar();
+
+        let _ = wm.conn.flush();
+
+        for fd in &mut fds {
+            fd.revents = 0;
+        }
+        fds[5] = poll_events(wm.policy.fd());
+
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), nfds, -1) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            eprintln!("[demiurge] poll error: {}", err);
+            break;
+        }
+
+        // Signal received. Drain all queued siginfo entries; SIGCHLD reaps,
+        // SIGINT/SIGTERM shut down.
+        if fds[1].revents & libc::POLLIN != 0 {
+            let mut shutdown = false;
+            loop {
+                let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
+                let n = unsafe {
+                    libc::read(
+                        signal_fd,
+                        &mut info as *mut _ as *mut libc::c_void,
+                        std::mem::size_of::<libc::signalfd_siginfo>(),
+                    )
+                };
+                if n as usize != std::mem::size_of::<libc::signalfd_siginfo>() {
+                    break;
+                }
+                match info.ssi_signo as i32 {
+                    libc::SIGCHLD => reap_children(),
+                    libc::SIGINT | libc::SIGTERM => {
+                        eprintln!("[demiurge] signal received, shutting down");
+                        shutdown = true;
+                    }
+                    _ => {}
+                }
+            }
+            if shutdown {
+                break;
+            }
+        }
+
+        // Timer tick: The clock is read again, and drawn and put at the
+        // next commit_bar() only if its text changed.
+        if fds[2].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 8];
+            unsafe {
+                libc::read(timer_fd, buf.as_mut_ptr() as *mut libc::c_void, 8);
+            }
+            if let Some(ref mut bar) = wm.bar {
+                bar.tick_clock();
+            }
+        }
+
+        // Cursor auto-hide tick (~100ms cadence). Polls pointer
+        // position via XQueryPointer and shows/hides via XFixes.
+        // No-op when [cursor] auto_hide is false.
+        if fds[4].revents & libc::POLLIN != 0 {
+            cursor::drain_timerfd(cursor_fd);
+            wm.cursor_tick();
+        }
+
+        // cherrypie answered (or went away): Map those windows as placed.
+        if fds[5].revents != 0 {
+            for (window, placement) in wm.policy.read() {
+                wm.admit(window, placement);
+            }
+        }
+
+        // Answers overdue: Those windows map with DEMIURGE's default.
+        if fds[6].revents & libc::POLLIN != 0 {
+            for window in wm.policy.expired() {
+                wm.admit(window, None);
+            }
+        }
+
+        // Config file changed: hot-reload
+        if fds[3].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 1024];
+            unsafe {
+                libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+            }
+            let paths = config::Paths::with_config(config_path.to_path_buf());
+            match config::load(&paths) {
+                Ok(cfg) => wm.reload_config(&cfg),
+                Err(e) => eprintln!(
+                    "[{}] [WARN]   config reload failed: {}",
+                    wm::local_time(),
+                    e,
+                ),
+            }
+        }
+
+        // X11 events will be drained at top of loop
+    }
+}
+
+fn cleanup(wm: &wm::Wm, timer_fd: i32, inotify_fd: i32, cursor_fd: i32) {
+    // Tear down the session's children before dropping the X connection,
+    // so terminals, music players, and tag-pinned helpers (montauk) exit
+    // alongside the WM instead of being reparented to init.
+    spawn::quit_children();
+
+    if let Some(ref bar) = wm.bar {
+        bar.destroy_all(&wm.conn);
+    }
+
+    let _ = wm.conn.destroy_window(wm.check_window);
+
+    let _ = wm.conn.delete_property(wm.root, wm.atoms._NET_SUPPORTED);
+    let _ = wm.conn.delete_property(wm.root, wm.atoms._NET_SUPPORTING_WM_CHECK);
+    let _ = wm.conn.flush();
+
+    unsafe {
+        if timer_fd >= 0 {
+            libc::close(timer_fd);
+        }
+        if inotify_fd >= 0 {
+            libc::close(inotify_fd);
+        }
+        if cursor_fd >= 0 {
+            libc::close(cursor_fd);
+        }
+    }
+}

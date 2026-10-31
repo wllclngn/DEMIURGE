@@ -1,0 +1,18 @@
+[package]
+name = "abraxas-core"
+version.workspace = true
+edition = "2021"
+description = "Dynamic color temperature daemon with weather awareness: What both stacks' binaries share"
+
+[lib]
+name = "abraxas"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+libc = "0.2"
+
+[features]
+default = ["noaa"]
+noaa = []

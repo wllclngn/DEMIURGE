@@ -1,0 +1,20 @@
+[package]
+name = "gordian_knot-x11"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gordian_knot"
+path = "src/main.rs"
+
+[dependencies]
+gordian_knot-core = { path = "../../core/gordian_knot" }
+demiurge-core = { path = "../../core/demiurge" }
+# The X11 lock: Its window, keyboard grab and the screensaver's idle time.
+x11rb = { version = "0.13", features = ["randr", "screensaver", "xinput", "xtest"] }
+libc = "0.2"
+xkbcommon = "0.8"
+# D-Bus client for the inhibit-watcher (logind ListInhibitors). zbus 4 with
+# its default async-io runtime (smol-based, tiny); its blocking re-exports
+# serve, since the D-Bus calls are infrequent.
+zbus = "4"

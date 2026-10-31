@@ -1,0 +1,18 @@
+[package]
+name = "abraxas-wl"
+version.workspace = true
+edition = "2021"
+
+[[bin]]
+name = "abraxas-wl"
+path = "src/main.rs"
+
+[dependencies]
+abraxas-core = { path = "../../core/abraxas", default-features = false }
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[features]
+default = ["noaa"]
+noaa = ["abraxas-core/noaa"]

@@ -1,0 +1,20 @@
+[package]
+name = "cherrypie-core"
+version.workspace = true
+edition.workspace = true
+description = "Window matching daemon for Linux: What both stacks' binaries share"
+
+[lib]
+name = "cherrypie"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+regex = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+toml = "0.8"

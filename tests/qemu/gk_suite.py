@@ -7,10 +7,12 @@ strand the session.
 
 Each test starts its own Xvfb (cookie in the test user's home, as on a
 real login) and drives the installed setuid /usr/local/bin/gordian_knot
-through gk-probe: XTest for X11 input, /dev/uinput for VT input.
+through gk-probe: XTest for X11 input, /dev/uinput for VT input. A plain
+`gordian_knot` with a display takes a VT now; the in-X lock is `--x11`.
 """
 
 import argparse
+import fcntl
 import os
 import signal
 import subprocess
@@ -170,7 +172,7 @@ def proc_status(pid: int) -> dict[str, str]:
 
 def test_x11_lock_holds_grab_and_paints():
     x = Xvfb(11)
-    lk = Locker("x11_basic", x.env)
+    lk = Locker("x11_basic", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "lock never held the grab with panels painted:\n" + lk.output())
         holder = proc_status(lk.proc.pid)
@@ -194,7 +196,7 @@ def test_x11_lock_holds_grab_and_paints():
 
 def test_wrong_then_right_password():
     x = Xvfb(12)
-    lk = Locker("x11_wrong_right", x.env)
+    lk = Locker("x11_wrong_right", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "never locked:\n" + lk.output())
         x.probe("type", "not-the-password")
@@ -210,7 +212,7 @@ def test_wrong_then_right_password():
 
 def test_ctrl_u_clears_the_field():
     x = Xvfb(13)
-    lk = Locker("x11_ctrl_u", x.env)
+    lk = Locker("x11_ctrl_u", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "never locked:\n" + lk.output())
         x.probe("type", "garbage")
@@ -226,7 +228,7 @@ def test_numpad_digits_count():
     pw = "knot42pw"
     subprocess.run(["chpasswd"], input=f"{USER}:{pw}", text=True, check=True)
     x = Xvfb(14)
-    lk = Locker("x11_numpad", x.env)
+    lk = Locker("x11_numpad", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "never locked:\n" + lk.output())
         x.probe("key", "Num_Lock")
@@ -245,7 +247,7 @@ def test_numpad_digits_count():
 
 def test_oversized_root_paints():
     x = Xvfb(15, "5120x2880")
-    lk = Locker("x11_oversized", x.env)
+    lk = Locker("x11_oversized", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 10), "a 5120x2880 root never painted the lock:\n" + lk.output())
         unlock(x, lk)
@@ -256,7 +258,7 @@ def test_oversized_root_paints():
 
 def test_killed_ui_keeps_the_lock():
     x = Xvfb(16)
-    lk = Locker("x11_killed_ui", x.env)
+    lk = Locker("x11_killed_ui", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "never locked:\n" + lk.output())
         kids = lk.children()
@@ -274,7 +276,7 @@ def test_killed_ui_keeps_the_lock():
 
 def test_faillock_notice_reaches_the_user():
     x = Xvfb(17)
-    lk = Locker("x11_faillock", x.env)
+    lk = Locker("x11_faillock", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "never locked:\n" + lk.output())
         for _ in range(3):
@@ -300,6 +302,94 @@ def active_vt() -> str:
     return Path("/sys/class/tty/tty0/active").read_text().strip()
 
 
+def release_console(vt: str) -> None:
+    """Whatever a failed test left: Every locker gone, VT switching unlocked,
+    `vt` active again. VT_LOCKSWITCH outlives its process."""
+    subprocess.run(["pkill", "-KILL", "-x", "gordian_knot"], check=False)
+    time.sleep(0.5)
+    with open("/dev/tty0", "wb", buffering=0) as console:
+        fcntl.ioctl(console, 0x560C, 1)  # VT_UNLOCKSWITCH
+        fcntl.ioctl(console, 0x5606, int(vt.removeprefix("tty")))  # VT_ACTIVATE
+
+
+def fb_geometry() -> tuple[int, int, int] | None:
+    base = Path("/sys/class/graphics/fb0")
+    if not base.exists() or (base / "bits_per_pixel").read_text().strip() != "32":
+        return None
+    w, h = (int(v) for v in (base / "virtual_size").read_text().strip().split(","))
+    return w, h, int((base / "stride").read_text())
+
+
+def fb_colors() -> int:
+    """Distinct pixel values across the framebuffer's middle third, where the
+    panels sit: A console or a flat fill shows a handful, the panels' text
+    and borders dozens."""
+    _, h, stride = fb_geometry()
+    with open("/dev/fb0", "rb") as f:
+        f.seek(stride * (h // 3))
+        band = f.read(stride * (h // 3))
+    return len({band[i:i + 4] for i in range(0, len(band), 4 * 5)})
+
+
+def ui_children(locker: "Locker") -> list[int]:
+    return [k for k in locker.children() if proc_status(k)["Uid"].split()[1] == str(uid())]
+
+
+def test_session_lock_takes_a_vt_and_draws_the_panels():
+    check(fb_geometry() is not None, "no 32-bit framebuffer in the guest (test premise)")
+    x = Xvfb(20)
+    before = active_vt()
+    lk = Locker("vt_panels", x.env)
+    try:
+        check(wait_for(lambda: active_vt() != before, 8), f"never left {before}:\n" + lk.output())
+        check(wait_for(lambda: fb_colors() > 16, 8), "the panels never reached the framebuffer:\n" + lk.output())
+        check(x.probe("grab-state") == "free", "the VT lock grabbed X input; X should get none")
+        ui = ui_children(lk)
+        check(len(ui) == 1, f"want one UI child as the user, found {ui}")
+        child = proc_status(ui[0])
+        check(child["NoNewPrivs"] == "1" and child["Seccomp"] == "2", f"UI child not sandboxed: {child}")
+        time.sleep(2)  # clock ticks through the sandboxed renderer
+        # An arrow key's escape sequence must not land in the password.
+        subprocess.run([PROBE, "uinput-key", "up"], check=True)
+        subprocess.run([PROBE, "uinput-type", PASSWORD], check=True)
+        subprocess.run([PROBE, "uinput-key", "enter"], check=True)
+        check(wait_for(lambda: not lk.alive(), 15), "the right password did not unlock:\n" + lk.output())
+        check(lk.proc.returncode == 0, f"locker exited {lk.proc.returncode}:\n" + lk.output())
+        check(wait_for(lambda: active_vt() == before, 5), f"{before} not given back ({active_vt()})")
+        check("seccomp: denied" not in lk.output(), "the UI child hit its seccomp filter:\n" + lk.output())
+    finally:
+        lk.close()
+        release_console(before)
+        x.close()
+        faillock_reset()
+
+
+def test_a_killed_vt_holder_gives_the_console_back_and_locks_in_x():
+    x = Xvfb(21)
+    before = active_vt()
+    lk = Locker("vt_killed", x.env)
+    try:
+        check(wait_for(lambda: active_vt() != before, 8), f"never left {before}:\n" + lk.output())
+        time.sleep(1)
+        os.kill(lk.proc.pid, signal.SIGKILL)
+        check(wait_for(lambda: active_vt() == before, 8),
+              f"the console stayed on {active_vt()} after the holder died:\n" + lk.output())
+        check("warden" in lk.output(), "no word from the warden:\n" + lk.output())
+        check(wait_for(lambda: locked(x), 10), "the warden did not lock the session again in X:\n" + lk.output())
+        # Switching is free again.
+        subprocess.run(["chvt", "3"], check=True)
+        check(wait_for(lambda: active_vt() == "tty3", 5), "VT switching is still locked")
+        subprocess.run(["chvt", before.removeprefix("tty")], check=True)
+        x.probe("type", PASSWORD)
+        x.probe("key", "Return")
+        check(wait_for(lambda: x.probe("grab-state") == "free", 15), "the relocked session did not unlock")
+    finally:
+        lk.close()
+        release_console(before)
+        x.close()
+        faillock_reset()
+
+
 def test_vt_lock_accepts_the_password():
     before = active_vt()
     lk = Locker("vt", user_env(), "--vt")
@@ -313,6 +403,7 @@ def test_vt_lock_accepts_the_password():
         check(wait_for(lambda: active_vt() == before, 5), f"VT not restored ({active_vt()} != {before})")
     finally:
         lk.close()
+        release_console(before)
         faillock_reset()
 
 
@@ -322,25 +413,27 @@ def test_daemon_spawns_one_locker():
     (cfg / "config.toml").write_text("[input.idle]\nlock_seconds = 2\n")
     os.chown(cfg / "config.toml", uid(), uid())
     x = Xvfb(18)
+    before = active_vt()
     daemon = Locker("daemon", x.env, "--daemon")
     try:
         inhibitors = lambda: subprocess.run(["systemd-inhibit", "--list", "--no-pager"],
                                             capture_output=True, text=True).stdout
         check(wait_for(lambda: "gordian_knot" in inhibitors(), 10),
               "no lock-before-suspend inhibitor registered:\n" + inhibitors() + daemon.output())
-        check(wait_for(lambda: locked(x), 20), "the daemon never locked an idle session:\n" + daemon.output())
+        check(wait_for(lambda: active_vt() != before, 20), "the daemon never locked an idle session:\n" + daemon.output())
         time.sleep(15)
         lockers = [p for p in daemon.children()]
         check(len(lockers) == 1, f"{len(lockers)} lockers running after 15 s idle and locked; want 1")
         pid = lockers[0]
-        x.probe("type", PASSWORD)
-        x.probe("key", "Return")
+        subprocess.run([PROBE, "uinput-type", PASSWORD], check=True)
+        subprocess.run([PROBE, "uinput-key", "enter"], check=True)
         gone = lambda: not Path(f"/proc/{pid}").exists() or proc_status(pid).get("State", "").startswith("Z")
         check(wait_for(gone, 15), "the daemon's locker did not exit on the right password")
-        check(x.probe("grab-state") == "free", "grab still held after the daemon's locker exited")
+        check(wait_for(lambda: active_vt() == before, 5), f"{before} not given back after the daemon's lock")
         check(daemon.alive(), "the daemon itself exited")
     finally:
         daemon.close()
+        release_console(before)
         x.close()
         (cfg / "config.toml").unlink(missing_ok=True)
 
@@ -349,7 +442,7 @@ def test_report_xi2_raw_events_during_lock():
     """REPORT: Whether another X client sees the password as XInput2 raw
     events while the lock holds the grab. Not a pass/fail gate."""
     x = Xvfb(19)
-    lk = Locker("x11_xi2", x.env)
+    lk = Locker("x11_xi2", x.env, "--x11")
     try:
         check(wait_for(lambda: locked(x), 8), "never locked:\n" + lk.output())
         spy = as_user([PROBE, "xi2-raw", "5"], x.env, stdout=subprocess.PIPE, text=True)
